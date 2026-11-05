@@ -1,0 +1,892 @@
+import { expect, test, type Page } from "@playwright/test";
+
+/**
+ * Flujo critico E2E: registro -> subida de panorama (tiler en navegador) ->
+ * crear tour -> escena -> hotspot -> publicar -> visor publico -> export.
+ */
+
+test.describe.configure({ mode: "serial" });
+
+const EMAIL = "e2e@andarama.test";
+const PASSWORD = "password-e2e-123";
+
+/** Genera un panorama equirect sintetico en el navegador y lo inyecta en el input de subida. */
+async function uploadSyntheticPano(page: Page, name: string, label: string, hue: number): Promise<void> {
+  await page.evaluate(
+    async ({ name, label, hue }) => {
+      // A propósito **no** son potencia de dos: con 2048x1024 no se veía que
+      // el troceador dejaba todas las teselas en negro para cualquier foto de
+      // una cámara real, que nunca mide una potencia de dos.
+      const W = 3000;
+      const H = 1500;
+      const c = document.createElement("canvas");
+      c.width = W;
+      c.height = H;
+      const ctx = c.getContext("2d")!;
+      const grad = ctx.createLinearGradient(0, 0, 0, H);
+      grad.addColorStop(0, `hsl(${hue}, 65%, 70%)`);
+      grad.addColorStop(1, `hsl(${(hue + 40) % 360}, 30%, 25%)`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 120px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(label, W / 2, H / 2);
+      const blob = await new Promise<Blob>((r) => c.toBlob((b) => r(b!), "image/jpeg", 0.85));
+      const dt = new DataTransfer();
+      dt.items.add(new File([blob], name, { type: "image/jpeg" }));
+      const input = document.querySelector<HTMLInputElement>('input[type="file"]')!;
+      input.files = dt.files;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    },
+    { name, label, hue },
+  );
+}
+
+test("registro del primer usuario", async ({ page }) => {
+  await page.goto("/studio/register");
+  await page.fill("#name", "Usuario E2E");
+  await page.fill("#email", EMAIL);
+  await page.fill("#password", PASSWORD);
+  await page.click('button[type="submit"]');
+  await page.waitForURL("**/studio/");
+  await expect(page.getByText("Nuevo tour").first()).toBeVisible();
+});
+
+test("subida de panorama con tiling en el navegador", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/media");
+  await page.waitForSelector('input[type="file"]', { state: "attached" });
+  await uploadSyntheticPano(page, "pano-e2e.jpg", "E2E", 200);
+  // Esperar a que el medio aparezca como panorama listo con tiles generados
+  await expect(page.getByText("pano-e2e.jpg")).toBeVisible({ timeout: 60_000 });
+  await expect
+    .poll(
+      async () => {
+        const me = (await (await page.request.get("/api/v1/me")).json()) as { orgs: { id: string }[] };
+        const items = (await (await page.request.get(`/api/v1/media?org=${me.orgs[0]!.id}`)).json()) as {
+          kind: string;
+          status: string;
+          derivatives: { kind: string }[];
+        }[];
+        const pano = items.find((m) => m.kind === "panorama");
+        return pano != null && pano.status === "ready" && pano.derivatives.some((d) => d.kind === "tiles");
+      },
+      { timeout: 60_000 },
+    )
+    .toBe(true);
+});
+
+test("las teselas del panorama tienen imagen, no salen en negro", async ({ page }) => {
+  await login(page);
+  const me = (await (await page.request.get("/api/v1/me")).json()) as { orgs: { id: string }[] };
+  const items = (await (await page.request.get(`/api/v1/media?org=${me.orgs[0]!.id}`)).json()) as {
+    id: string;
+    kind: string;
+    derivatives: { kind: string; manifest: { extension?: string; faceSize?: number } }[];
+  }[];
+  const pano = items.find((m) => m.kind === "panorama")!;
+  const tiles = pano.derivatives.find((d) => d.kind === "tiles")!;
+  await page.goto("/studio/");
+  const analisis = await page.evaluate(
+    async ({ id, ext }) => {
+      const leer = async (ruta: string): Promise<{ status: number; colores: number; luz: number }> => {
+        const res = await fetch(`/api/v1/media/${id}/tiles/${ruta}.${ext}`);
+        if (!res.ok) return { status: res.status, colores: 0, luz: 0 };
+        const bmp = await createImageBitmap(await res.blob());
+        const c = new OffscreenCanvas(bmp.width, bmp.height);
+        c.getContext("2d")!.drawImage(bmp, 0, 0);
+        const d = c.getContext("2d")!.getImageData(0, 0, bmp.width, bmp.height).data;
+        const colores = new Set<string>();
+        let suma = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          colores.add(`${d[i]},${d[i + 1]},${d[i + 2]}`);
+          suma += (d[i]! + d[i + 1]! + d[i + 2]!) / 3;
+        }
+        bmp.close();
+        return { status: res.status, colores: colores.size, luz: suma / (d.length / 4) };
+      };
+      return { frente: await leer("0/f/0/0"), arriba: await leer("0/u/0/0"), abajo: await leer("0/d/0/0") };
+    },
+    { id: pano.id, ext: tiles.manifest.extension ?? "webp" },
+  );
+  expect(analisis.frente.status).toBe(200);
+  // Una tesela real tiene cientos de colores; una rota, uno solo (negro)
+  expect(analisis.frente.colores).toBeGreaterThan(20);
+  // El panorama de prueba tiene el degradado claro arriba y oscuro abajo: si el
+  // techo y el suelo se intercambian, esto lo caza.
+  expect(analisis.arriba.luz).toBeGreaterThan(analisis.abajo.luz + 20);
+});
+
+test("crear tour, escena, hotspot y publicar", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByRole("button", { name: "Nuevo tour" }).first().click();
+  await page.fill("#np-title", "Tour E2E");
+  await page.getByRole("button", { name: "Crear", exact: true }).click();
+  await page.waitForURL("**/studio/p/**");
+
+  // Añadir escena con el panorama subido
+  await page.locator('button[aria-label="Añadir escena"]').click();
+  await page.fill("#ns-title", "Escena E2E");
+  const sceneDialog = page.locator('[role="dialog"]', { hasText: "Añadir escena" });
+  await sceneDialog.getByRole("button", { name: "Elegir de la biblioteca" }).click();
+  const picker = page.locator('[role="dialog"]', { hasText: "Elegir de la biblioteca" }).last();
+  await picker.getByRole("button", { name: /pano-e2e\.jpg/ }).click();
+  await sceneDialog.getByRole("button", { name: "Crear", exact: true }).click();
+
+  // La vista previa WYSIWYG monta el visor real
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+
+  // Texto alternativo de la escena (accesibilidad)
+  await page.fill("#sc-alt", "Escena de prueba E2E");
+
+  // Colocar un hotspot de texto: paleta buscable y clic sobre el panorama
+  // Hay dos accesos a la paleta: el de la barra del visor y el del panel
+  await page.getByRole("button", { name: /añadir hotspot/i }).first().click();
+  await page.locator('[role="dialog"] input').first().fill("texto");
+  await page.getByRole("button", { name: /^Texto/ }).first().click();
+  await page.locator(".anda-viewer").first().click({ position: { x: 500, y: 350 } });
+  await page.fill("#hs-label", "Panel E2E");
+  await page.fill("#hs-body", "Contenido **markdown** de prueba");
+  await page.fill("#hs-alt", "Panel de prueba");
+
+  // Esperar autosave y publicar
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+  await page.locator("header").getByRole("button", { name: "Publicar" }).click();
+  const publishDialog = page.locator('[role="dialog"]', { hasText: "Publicar tour" });
+  await publishDialog.getByRole("button", { name: /^(Publicar|Republicar)$/ }).click();
+  // El primero es el enlace publicado; debajo va el del otro modo de apertura
+  const link = publishDialog.locator('a[href*="/t/"]').first();
+  await expect(link).toBeVisible({ timeout: 30_000 });
+  // El enlace recién publicado se copia desde aquí mismo
+  await expect(publishDialog.getByRole("button", { name: "Copiar" }).first()).toBeVisible();
+});
+
+test("el grafo tiene los cuatro modos y el plano ya no es una pestaña", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  const projectUrl = page.url().split("?")[0]!;
+
+  await page.goto(`${projectUrl}?tab=graph`);
+  const modos = page.getByRole("group", { name: "Modo del lienzo" });
+  for (const modo of ["Escenas", "Plano", "Mapa", "Autopilot"]) {
+    await expect(modos.getByRole("button", { name: modo, exact: true })).toBeVisible({ timeout: 20_000 });
+  }
+  // El plano dejó de ser una pestaña del editor
+  await expect(page.locator('nav[aria-label="Vistas del editor"] button', { hasText: "Plano" })).toHaveCount(0);
+
+  // Los enlaces antiguos siguen llevando donde llevaban
+  await page.goto(`${projectUrl}?tab=floorplan`);
+  await expect(page.getByRole("group", { name: "Modo del lienzo" }).getByRole("button", { name: "Plano", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+    { timeout: 20_000 },
+  );
+  await expect.poll(() => page.url()).toContain("mode=plan");
+
+  // Desde la lista de escenas se llega al plano con un botón a la vista
+  await page.goto(projectUrl);
+  await page.getByRole("button", { name: /Plano del recorrido/ }).click();
+  await expect(page.getByRole("group", { name: "Modo del lienzo" }).getByRole("button", { name: "Plano", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+    { timeout: 20_000 },
+  );
+});
+
+test("carpetas: crear, meter un tour dentro arrastrando y sacarlo", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+
+  await page.getByRole("button", { name: "Nueva carpeta" }).click();
+  await page.fill("#nf-name", "Planta baja");
+  await page.getByRole("button", { name: "Crear", exact: true }).click();
+  // Al crearla se entra dentro, y está vacía
+  await expect(page.getByText("0 recorridos en esta carpeta")).toBeVisible({ timeout: 15_000 });
+
+  // En la raíz aparece la carpeta junto a los tours sueltos
+  await page.getByRole("button", { name: "Todos los proyectos" }).click();
+  await expect(page.getByText("Planta baja").first()).toBeVisible();
+
+  // Arrastrar el tour sobre la carpeta. Se sintetiza el arrastre HTML5 porque
+  // es exactamente lo que hace el ratón, y es el gesto que se quiere probar.
+  const arrastre = await page.evaluate(() => {
+    const tarjetas = [...document.querySelectorAll(".grid > div")];
+    const tour = tarjetas.find((d) => d.textContent?.includes("Tour E2E"));
+    const carpeta = tarjetas.find((d) => d.textContent?.includes("Planta baja"));
+    if (tour == null || carpeta == null) return "faltan tarjetas";
+    const dt = new DataTransfer();
+    tour.dispatchEvent(new DragEvent("dragstart", { dataTransfer: dt, bubbles: true }));
+    carpeta.dispatchEvent(new DragEvent("dragover", { dataTransfer: dt, bubbles: true, cancelable: true }));
+    carpeta.dispatchEvent(new DragEvent("drop", { dataTransfer: dt, bubbles: true, cancelable: true }));
+    return "ok";
+  });
+  expect(arrastre).toBe("ok");
+
+  // Ya está dentro: la carpeta lo cuenta y deja de estar suelto
+  await expect(page.getByText("1 recorrido", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await page.getByText("Planta baja").first().click();
+  await expect(page.getByText("Tour E2E").first()).toBeVisible();
+
+  // Y se saca desde el menú de la tarjeta
+  await page.locator(".grid > div").first().getByRole("button", { name: "Acciones" }).click();
+  await page.getByText("Sacar de la carpeta").click();
+  await page.getByRole("button", { name: "Todos los proyectos" }).click();
+  await expect(page.getByText("0 recorridos", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("Tour E2E").first()).toBeVisible();
+});
+
+test("autopilot: pulsar escenas crea el recorrido sin ceremonia", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  const projectUrl = page.url().split("?")[0]!;
+  await page.goto(`${projectUrl}?tab=graph&mode=autopilot`);
+
+  const modos = page.getByRole("group", { name: "Modo del lienzo" });
+  await expect(modos.getByRole("button", { name: "Autopilot", exact: true })).toHaveAttribute("aria-pressed", "true", { timeout: 20_000 });
+
+  // Sin recorridos aún: el panel lo dice y el primer clic crea la ruta
+  await expect(page.getByText("Todavía no hay ningún recorrido")).toBeVisible();
+  const nodo = page.getByRole("button", { name: /^Escena E2E/ }).first();
+  await nodo.click();
+  await expect(page.getByRole("listitem").filter({ hasText: "Escena E2E" })).toHaveCount(1, { timeout: 10_000 });
+  // Otro clic añade la segunda parada (revisitar está permitido)
+  await nodo.click();
+  await expect(page.getByRole("listitem").filter({ hasText: "Escena E2E" })).toHaveCount(2);
+
+  // El recorrido sobrevive a recargar: se guardó en el borrador
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+  await page.reload();
+  await expect(page.getByRole("listitem").filter({ hasText: "Escena E2E" })).toHaveCount(2, { timeout: 20_000 });
+});
+
+test("un área es la categoría del menú de escenas", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+
+  // El área se crea desde el panel del grafo...
+  await page.goto(`${page.url().split("?")[0]!}?tab=graph`);
+  await page.getByRole("button", { name: "Áreas", exact: true }).click();
+  await page.getByRole("button", { name: "Nueva área" }).click();
+  const nombre = page.getByLabel("Nombre del área").first();
+  await expect(nombre).toBeVisible({ timeout: 10_000 });
+  await nombre.fill("Planta baja");
+
+  // ...y se asigna desde las propiedades de la escena
+  await page.locator('nav[aria-label="Vistas del editor"]').getByRole("button", { name: "Escenas" }).click();
+  await page.locator("#sc-area").selectOption({ label: "Planta baja" });
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+
+  // Y llega al tour publicado como categoría del menú de escenas
+  await page.locator("header").getByRole("button", { name: "Republicar" }).click();
+  const dialog = page.locator('[role="dialog"]', { hasText: "Publicar tour" });
+  await dialog.getByRole("button", { name: /^(Publicar|Republicar)$/ }).click();
+  await expect(dialog.locator('a[href*="/t/"]').first()).toBeVisible({ timeout: 30_000 });
+  const tour = (await (await page.request.get("/t/tour-e2e/tour.json")).json()) as { scenes: { category?: string }[] };
+  expect(tour.scenes[0]!.category).toBe("Planta baja");
+});
+
+test("la previsualizacion recorre el borrador y guarda la llegada", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  const projectUrl = page.url().split("?")[0]!;
+
+  await page.goto(`${projectUrl}?tab=preview`);
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 40_000 });
+  // La barra dice donde estas y por donde has entrado
+  await expect(page.getByText(/Estás en/)).toBeVisible({ timeout: 20_000 });
+
+  const antes = (await (await page.request.get(`/api/v1/projects/${projectUrl.split("/p/")[1]}/scenes`)).json()) as {
+    scenes: { id: string; initialViewJson: string | null }[];
+  };
+  await page.getByRole("button", { name: /Guardar como vista de inicio/ }).click();
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+  const despues = (await (await page.request.get(`/api/v1/projects/${projectUrl.split("/p/")[1]}/scenes`)).json()) as {
+    scenes: { id: string; initialViewJson: string | null }[];
+  };
+  // Guardar la llegada escribe la vista inicial de la escena de arranque
+  expect(despues.scenes[0]!.initialViewJson).not.toBe(antes.scenes[0]!.initialViewJson);
+  expect(JSON.parse(despues.scenes[0]!.initialViewJson!)).toHaveProperty("yaw");
+});
+
+test("visor publico: navegacion, panel y deep link", async ({ page }) => {
+  await page.goto("/t/tour-e2e");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".anda-title")).toHaveText("Tour E2E");
+  // Abrir el panel de texto
+  await page.locator('.anda-hotspot[aria-label*="Panel E2E"]').click();
+  await expect(page.locator(".anda-panel")).toContainText("markdown");
+  await page.keyboard.press("Escape");
+  // Deep link presente en la URL
+  await expect.poll(() => page.url()).toContain("#s=");
+  // Modo accesible
+  await page.locator('button[aria-label="Versión accesible"]').click();
+  await expect(page.locator(".anda-accessible")).toContainText("Escena E2E");
+});
+
+test("publicar en modo quiosco: el enlace de siempre arranca en bucle", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  const projectUrl = page.url().split("?")[0]!;
+
+  const publicar = async (modo: "kiosk" | "tour"): Promise<void> => {
+    await page.goto(projectUrl);
+    await page.locator("header").getByRole("button", { name: /Publicar|Republicar/ }).click();
+    const dlg = page.locator('[role="dialog"]', { hasText: "Publicar tour" });
+    await dlg.locator("#pb-modo").selectOption(modo);
+    await dlg.getByRole("button", { name: /^(Publicar|Republicar)$/ }).click();
+    await expect(dlg.locator('a[href*="/t/"]').first()).toBeVisible({ timeout: 60_000 });
+    // El otro modo queda a mano sin republicar
+    await expect(dlg.getByText(modo === "kiosk" ? "Recorrido normal:" : "Modo quiosco:")).toBeVisible();
+  };
+
+  // Publicado como quiosco, la direccion de siempre ya sale en bucle. El
+  // parametro `v` solo evita el cache del navegador: la pagina publica se
+  // sirve con max-age de 60 s y aqui se cambia de modo en segundos.
+  await publicar("kiosk");
+  await page.goto("/t/tour-e2e?v=quiosco");
+  await expect(page.locator(".anda-kiosk")).toBeVisible({ timeout: 30_000 });
+  // Del tour en bucle sale el recorrido suelto sin republicar
+  await page.goto("/t/tour-e2e?kiosk=0&v=suelto");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".anda-kiosk")).toHaveCount(0);
+
+  // Y de vuelta al recorrido normal, donde el parametro sigue valiendo
+  await publicar("tour");
+  await page.goto("/t/tour-e2e?v=normal");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".anda-kiosk")).toHaveCount(0);
+  await page.goto("/t/tour-e2e?kiosk=1&v=forzado");
+  await expect(page.locator(".anda-kiosk")).toBeVisible({ timeout: 30_000 });
+
+  // La barra no puede taparle la cara a las miniaturas
+  const solapan = await page.evaluate(() => {
+    const barra = document.querySelector(".anda-kiosk")?.getBoundingClientRect();
+    const tiras = document.querySelector(".anda-thumbs")?.getBoundingClientRect();
+    if (barra == null || tiras == null) return false;
+    return tiras.bottom > barra.top + 4;
+  });
+  expect(solapan).toBe(false);
+});
+
+test("el tour compartido lleva tarjeta con imagen propia", async ({ request }) => {
+  // Pegar un tour en un chat tiene que enseñar el panorama, no un enlace pelado
+  const html = await (await request.get("/t/tour-e2e")).text();
+  expect(html).toContain('<meta name="twitter:card" content="summary_large_image">');
+  expect(html).toContain('property="og:site_name" content="andarama"');
+  const og = /<meta property="og:image" content="([^"]+)">/.exec(html);
+  expect(og).not.toBeNull();
+  expect(og![1]).toContain("/t/tour-e2e/share.jpg");
+
+  const img = await request.get("/t/tour-e2e/share.jpg");
+  expect(img.ok()).toBeTruthy();
+  expect(img.headers()["content-type"]).toContain("image/");
+  // Que sea una imagen de verdad y no un placeholder de cuatro bytes
+  expect((await img.body()).length).toBeGreaterThan(2000);
+});
+
+test("tour.json publicado es valido y estatico", async ({ request }) => {
+  const res = await request.get("/t/tour-e2e/tour.json");
+  expect(res.ok()).toBeTruthy();
+  const tour = await res.json();
+  expect(tour.version).toBe(1);
+  expect(tour.scenes.length).toBe(1);
+  expect(tour.scenes[0].hotspots.length).toBe(1);
+});
+
+test("web component embebible servido en /embed.js", async ({ request }) => {
+  const res = await request.get("/embed.js");
+  expect(res.ok()).toBeTruthy();
+  const js = await res.text();
+  expect(js).toContain("anda-tour");
+  expect(js).toContain("customElements.define");
+});
+
+test("medios: renombrar y asignar a tour via API", async ({ page }) => {
+  await login(page);
+  const me = (await (await page.request.get("/api/v1/me")).json()) as { orgs: { id: string }[] };
+  const orgId = me.orgs[0]!.id;
+  const items = (await (await page.request.get(`/api/v1/media?org=${orgId}`)).json()) as { id: string; filename: string }[];
+  const item = items[0]!;
+  const patch = await page.request.patch(`/api/v1/media/${item.id}`, {
+    data: { filename: "pano-renombrado.jpg" },
+    headers: { "x-csrf-token": await csrf(page) },
+  });
+  expect(patch.ok()).toBeTruthy();
+  const after = (await (await page.request.get(`/api/v1/media?org=${orgId}`)).json()) as { id: string; filename: string }[];
+  expect(after.find((m) => m.id === item.id)?.filename).toBe("pano-renombrado.jpg");
+  // Un medio referenciado por una escena no puede borrarse (409)
+  const del = await page.request.delete(`/api/v1/media/${item.id}`, { headers: { "x-csrf-token": await csrf(page) } });
+  expect(del.status()).toBe(409);
+});
+
+test("admin: crear organizacion y usuario desde la API", async ({ page }) => {
+  await login(page);
+  const token = await csrf(page);
+  const org = await page.request.post("/api/v1/admin/orgs", {
+    data: { name: "Facultad E2E" },
+    headers: { "x-csrf-token": token },
+  });
+  expect(org.status()).toBe(201);
+  const { id: orgId } = (await org.json()) as { id: string };
+  const user = await page.request.post("/api/v1/admin/users", {
+    data: { email: "docente@andarama.test", name: "Docente E2E", password: "password-e2e-456", orgId },
+    headers: { "x-csrf-token": token },
+  });
+  expect(user.status()).toBe(201);
+  const list = (await (await page.request.get("/api/v1/admin/users")).json()) as { email: string }[];
+  expect(list.some((u) => u.email === "docente@andarama.test")).toBeTruthy();
+});
+
+test("un hotspot de navegación ofrece el salto a su escena, y el icono se puede girar", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+
+  // Una segunda escena para tener un destino distinto
+  await page.locator('button[aria-label="Añadir escena"]').click();
+  await page.fill("#ns-title", "Escena destino");
+  const sceneDialog = page.locator('[role="dialog"]', { hasText: "Añadir escena" });
+  await sceneDialog.getByRole("button", { name: "Elegir de la biblioteca" }).click();
+  const picker = page.locator('[role="dialog"]', { hasText: "Elegir de la biblioteca" }).last();
+  await picker.getByRole("button", { name: /\.jpg/ }).first().click();
+  await sceneDialog.getByRole("button", { name: "Crear", exact: true }).click();
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+
+  // Volver a la primera y colocar allí el paso hacia la nueva
+  await abrirEscena(page, "Escena E2E");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: /añadir hotspot/i }).first().click();
+  await page.locator('[role="dialog"] input').first().fill("navegación");
+  await page.getByRole("button", { name: /^Navegación/ }).first().click();
+  await page.locator(".anda-viewer").first().click({ position: { x: 520, y: 300 } });
+  await page.selectOption("#hs-target", { label: "Escena destino" });
+
+  // El salto aparece pegado al marcador y lleva a la escena de destino
+  const salto = page.locator(".anda-salto");
+  await expect(salto).toBeVisible({ timeout: 20_000 });
+  await expect(salto).toContainText("Escena destino");
+  // El paso se coloca en un rumbo concreto para poder comprobar la llegada.
+  // La sección «Posición» sale plegada: se abre antes de escribir.
+  await page.locator("summary", { hasText: "Posición" }).first().click();
+  await page.fill("#hs-yaw", "60");
+  await page.locator("#hs-yaw").blur();
+  await salto.click();
+  await expect(page.locator("#sc-title")).toHaveValue("Escena destino", { timeout: 20_000 });
+
+  // Un paso recién creado llega a la vista por defecto de la escena destino
+  // (yaw 0), no al rumbo del propio paso (60°): es lo que el docente fija con
+  // «Usar vista actual» y lo que espera ver al llegar.
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await expect
+    .poll(
+      async () =>
+        await page.evaluate(() => {
+          const aguja = document.querySelector<SVGGElement>(".anda-compass__needle");
+          const m = /rotate\((-?[\d.]+)deg\)/.exec(aguja?.style.transform ?? "");
+          if (m == null) return null;
+          // La aguja marca el norte respecto a la vista: el yaw es su opuesto
+          const yaw = ((-parseFloat(m[1]!) % 360) + 360) % 360;
+          return Math.round(Math.min(yaw, 360 - yaw));
+        }),
+      { timeout: 20_000 },
+    )
+    .toBeLessThan(5);
+
+  // El giro del icono llega al marcador del panorama
+  await abrirEscena(page, "Escena E2E");
+  await expect(page.locator(".anda-hotspot").first()).toBeVisible({ timeout: 30_000 });
+  await page.locator(".anda-hotspot").first().click();
+  await page.getByRole("button", { name: "Estilo", exact: true }).click();
+  await page.getByRole("button", { name: "135°", exact: true }).click();
+  await expect
+    .poll(
+      async () =>
+        await page.evaluate(() => {
+          const glifo = document.querySelector<HTMLElement>(".anda-hotspot__icon > *");
+          return glifo?.style.transform ?? "";
+        }),
+      { timeout: 30_000 },
+    )
+    .toBe("rotate(135deg)");
+});
+
+test("la barra de vídeo no se queda de pastilla negra en las escenas de foto", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  const visible = await page.evaluate(() => {
+    const barra = document.querySelector<HTMLElement>(".anda-videobar");
+    if (barra == null) return false;
+    return getComputedStyle(barra).display !== "none" || barra.getBoundingClientRect().height > 0;
+  });
+  expect(visible).toBe(false);
+});
+
+/** Elegir una escena de la lista sin tropezar con sus botones flotantes. */
+async function abrirEscena(page: Page, titulo: string): Promise<void> {
+  await page.locator(".anda-ficha").filter({ hasText: titulo }).first().click({ position: { x: 40, y: 20 } });
+}
+
+/** Token CSRF de la cookie u3c de la sesion actual. */
+async function csrf(page: Page): Promise<string> {
+  const cookies = await page.context().cookies();
+  return cookies.find((c) => c.name === "u3c")?.value ?? "";
+}
+
+/**
+ * Sesion compartida entre pruebas. Cada prueba estrena contexto, asi que
+ * autenticarse de verdad en todas acababa chocando con el limite de intentos
+ * de login (ocho por cuarto de hora), que es una proteccion deseable: se
+ * reutilizan las cookies de la primera.
+ */
+let sessionCookies: Awaited<ReturnType<Page["context"]>["cookies"]> extends Promise<infer T> ? T : never = [] as never;
+
+
+test("el tesoro se guarda, se ve en la vista previa y no impide publicar", async ({ page }) => {
+  // Antes ni la API ni el validador conocían el tipo «treasure»: el guardado
+  // fallaba en silencio y publicar dejaba la versión antigua sin los hotspots
+  // nuevos. Es el fallo que más confundió a los probadores.
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  await abrirEscena(page, "Escena E2E");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+
+  await page.getByRole("button", { name: /añadir hotspot/i }).first().click();
+  await page.locator('[role="dialog"] input').first().fill("tesoro");
+  await page.getByRole("button", { name: /^Tesoro/ }).first().click();
+  await page.locator(".anda-viewer").first().click({ position: { x: 640, y: 420 } });
+  await page.fill("#hs-label", "Cofre E2E");
+  await page.fill("#hs-alt", "Cofre escondido");
+  // Se guarda de verdad (nada de «Sin guardar») y el marcador aparece en la vista previa
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator(".anda-hotspot--treasure").first()).toBeVisible({ timeout: 30_000 });
+
+  // Y se publica con él
+  await page.locator("header").getByRole("button", { name: /Publicar|Republicar/ }).click();
+  const dlg = page.locator('[role="dialog"]', { hasText: "Publicar tour" });
+  await dlg.getByRole("button", { name: /^(Publicar|Republicar)$/ }).click();
+  await expect(dlg.locator('a[href*="/t/"]').first()).toBeVisible({ timeout: 60_000 });
+  const tour = (await (await page.request.get("/t/tour-e2e/tour.json?v=tesoro")).json()) as {
+    treasureHunt?: { enabled: boolean; targets: unknown[] };
+    scenes: { hotspots: { type: string }[] }[];
+  };
+  expect(tour.scenes.some((sc) => sc.hotspots.some((h) => h.type === "treasure"))).toBe(true);
+  expect(tour.treasureHunt?.enabled).toBe(true);
+  expect(tour.treasureHunt?.targets.length).toBe(1);
+});
+
+test("la dirección de YouTube se convierte sola en el ID del vídeo", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  await abrirEscena(page, "Escena E2E");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: /añadir hotspot/i }).first().click();
+  await page.locator('[role="dialog"] input').first().fill("youtube");
+  await page.getByRole("button", { name: /^YouTube/ }).first().click();
+  // Con la franja de «Primeros pasos» y la biblioteca abajo el visor mide
+  // unos 450 px de alto a 1440×900: el clic tiene que caer dentro.
+  await page.locator(".anda-viewer").first().click({ position: { x: 300, y: 380 } });
+  await page.fill("#hs-videoId", "https://youtu.be/5PAIFUrQYOs?si=BmxpoV3sN_m3gGvi&t=90");
+  await expect(page.locator("#hs-videoId")).toHaveValue("5PAIFUrQYOs");
+  // El segundo de inicio de la dirección también se recoge
+  await expect(page.locator("#hs-start")).toHaveValue("90");
+  // Limpieza: que el tour publicado no arrastre este marcador de prueba
+  await page.getByRole("button", { name: "Eliminar", exact: true }).first().click();
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+});
+
+test("con una proyección puesta los hotspots siguen en su sitio y el menú explica cada una", async ({ page }) => {
+  await page.goto("/t/tour-e2e?v=proyeccion");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".anda-hotspot").first()).toBeVisible({ timeout: 30_000 });
+  await page.locator('button[aria-label="Proyección"]').click();
+  const menu = page.locator(".anda-menu-pop");
+  await expect(menu).toContainText("planeta pequeño");
+  await menu.getByRole("menuitem", { name: /Little planet/ }).click();
+  // El pase se asienta y los marcadores pasan a colocarse a mano
+  await expect(page.locator(".anda-projection-active").first()).toBeVisible({ timeout: 30_000 });
+  // Con el zoom por defecto el planeta enseña solo el casquete central y el
+  // horizonte, donde están los marcadores, queda fuera del lienzo: se aleja
+  await page.evaluate(() =>
+    (window as unknown as { Andarama: { instance: { viewer: { setView(v: { fov: number }): void } } } }).Andarama.instance.viewer.setView({ fov: 2.4 }),
+  );
+  await expect
+    .poll(
+      async () =>
+        await page.evaluate(() => {
+          const hs = [...document.querySelectorAll<HTMLElement>(".anda-hotspot")];
+          const stage = document.querySelector<HTMLElement>(".anda-projection-active");
+          if (stage == null || hs.length === 0) return "sin marcadores";
+          const w = stage.clientWidth;
+          const h = stage.clientHeight;
+          const colocado = hs.find((el) => el.style.display !== "none" && el.style.left !== "");
+          if (colocado == null) return "ninguno colocado";
+          const x = parseFloat(colocado.style.left);
+          const y = parseFloat(colocado.style.top);
+          return x >= 0 && x <= w && y >= 0 && y <= h ? "dentro" : `fuera ${x},${y}`;
+        }),
+      { timeout: 30_000 },
+    )
+    .toBe("dentro");
+  // De vuelta a la normal, manda Marzipano otra vez
+  await page.locator('button[aria-label="Proyección"]').click();
+  await page.locator(".anda-menu-pop").getByRole("menuitem", { name: /Normal/ }).click();
+  await expect(page.locator(".anda-projection-active")).toHaveCount(0, { timeout: 30_000 });
+});
+
+test("el quiosco sin bucle termina en la escena inicial y espera a que alguien lo pida", async ({ page }) => {
+  // El recorrido de la prueba de autopilot tiene dos paradas de seis segundos
+  // y, al nacer con «repetir en bucle» apagado, se ve una vez y se detiene
+  await page.goto("/t/tour-e2e?kiosk=1&v=fin");
+  await expect(page.locator(".anda-kiosk")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".anda-kiosk")).toContainText("Reproduciendo", { timeout: 30_000 });
+  await expect(page.locator(".anda-kiosk")).toContainText("El recorrido ha terminado", { timeout: 60_000 });
+  await expect(page.locator(".anda-kiosk").getByRole("button", { name: "Verlo otra vez" })).toBeVisible();
+  // Y al pedirlo, vuelve a reproducirse
+  await page.locator(".anda-kiosk").getByRole("button", { name: "Verlo otra vez" }).click();
+  await expect(page.locator(".anda-kiosk")).toContainText("Reproduciendo", { timeout: 30_000 });
+});
+
+test("la compuerta de una pregunta retiene en la escena hasta acertar", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  await abrirEscena(page, "Escena E2E");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: /añadir hotspot/i }).first().click();
+  await page.locator('[role="dialog"] input').first().fill("quiz");
+  await page.getByRole("button", { name: /^Quiz/ }).first().click();
+  // Por encima de la bandeja de medios, que ocupa el pie del editor
+  await page.locator(".anda-viewer").first().click({ position: { x: 420, y: 280 } });
+  await page.fill("#hs-label", "Pregunta E2E");
+  await page.fill("#qz-q", "¿Dos y dos?");
+  await page.locator("#qz-gate").click();
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+  await page.locator("header").getByRole("button", { name: /Publicar|Republicar/ }).click();
+  const dlg = page.locator('[role="dialog"]', { hasText: "Publicar tour" });
+  await dlg.getByRole("button", { name: /^(Publicar|Republicar)$/ }).click();
+  await expect(dlg.locator('a[href*="/t/"]').first()).toBeVisible({ timeout: 60_000 });
+
+  await page.goto("/t/tour-e2e?kiosk=0&v=compuerta");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  const escenaActual = (): Promise<string | null> =>
+    page.evaluate(() => (window as unknown as { Andarama: { instance: { viewer: { currentSceneId(): string | null } } } }).Andarama.instance.viewer.currentSceneId());
+  const inicial = await escenaActual();
+  // El paso está a 60° de rumbo, debajo del dique de controles: se centra la
+  // vista sobre él para poder pulsarlo
+  const centrarPaso = (): Promise<void> =>
+    page.evaluate(() =>
+      (window as unknown as { Andarama: { instance: { viewer: { setView(v: { yaw: number; pitch: number }): void } } } }).Andarama.instance.viewer.setView({
+        yaw: Math.PI / 3,
+        pitch: 0,
+      }),
+    );
+  // Los pasos se ven apagados y no sacan de la escena
+  await expect(page.locator(".anda-nav-gated").first()).toBeVisible({ timeout: 30_000 });
+  await centrarPaso();
+  await page.locator(".anda-hotspot--navigation").first().click();
+  // El contador del tesoro también es un .anda-toast (fijo, --hud): el aviso es el otro
+  await expect(page.locator(".anda-toast:not(.anda-toast--hud)")).toContainText("Responde correctamente para poder avanzar", {
+    timeout: 10_000,
+  });
+  expect(await escenaActual()).toBe(inicial);
+  // Al chocar con la compuerta se abre la pregunta; acertar abre la salida
+  const panel = page.locator(".anda-panel");
+  await expect(panel).toContainText("¿Dos y dos?");
+  await panel.locator(".anda-quiz__option").first().click();
+  await panel.getByRole("button", { name: "Comprobar" }).click();
+  // Era la única pregunta del tour: al acertarla sale el informe final
+  const informe = page.locator(".anda-screen", { hasText: "Informe del cuestionario" });
+  await expect(informe).toBeVisible({ timeout: 10_000 });
+  await expect(informe).toContainText("Puntuación: 1 / 1");
+  await informe.getByRole("button", { name: "Cerrar" }).click();
+  await expect(page.locator(".anda-nav-gated")).toHaveCount(0, { timeout: 10_000 });
+  await centrarPaso();
+  await page.locator(".anda-hotspot--navigation").first().click();
+  await expect.poll(escenaActual, { timeout: 30_000 }).not.toBe(inicial);
+});
+
+test("un quiz con dos preguntas en el mismo marcador se responde de una en una", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  const projectUrl = page.url().split("?")[0]!;
+  await abrirEscena(page, "Escena E2E");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: /añadir hotspot/i }).first().click();
+  await page.locator('[role="dialog"] input').first().fill("quiz");
+  await page.getByRole("button", { name: /^Quiz/ }).first().click();
+  await page.locator(".anda-viewer").first().click({ position: { x: 560, y: 300 } });
+  await page.fill("#hs-label", "Cuestionario E2E");
+  await page.fill("#qz-q", "¿Cuántas islas tiene Canarias?");
+  // La segunda pregunta va en el mismo marcador, no en uno nuevo
+  await page.getByRole("button", { name: "Añadir pregunta", exact: true }).click();
+  const segunda = page.locator('[data-quiz-question="2"]');
+  await expect(segunda).toBeVisible();
+  await page.fill("#qz-q-1", "¿Es el Teide un volcán?");
+  await segunda.getByRole("textbox", { name: "Opción 1" }).fill("Sí");
+  await segunda.getByRole("textbox", { name: "Opción 2" }).fill("No");
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+
+  // En la vista previa se responden de una en una y al final sale el resumen
+  await page.goto(`${projectUrl}?tab=preview`);
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 40_000 });
+  const marcador = page.locator('.anda-hotspot--quiz[aria-label*="Cuestionario E2E"]').first();
+  await expect(marcador).toBeAttached({ timeout: 30_000 });
+  await marcador.dispatchEvent("click");
+  const panel = page.locator(".anda-panel");
+  await expect(panel).toContainText("Pregunta 1 de 2");
+  await expect(panel).toContainText("¿Cuántas islas tiene Canarias?");
+  await panel.locator(".anda-quiz__option:visible").first().click();
+  await panel.getByRole("button", { name: "Comprobar" }).locator("visible=true").click();
+  await panel.getByRole("button", { name: "Siguiente" }).click();
+  await expect(panel).toContainText("Pregunta 2 de 2");
+  await expect(panel).toContainText("¿Es el Teide un volcán?");
+  await panel.locator(".anda-quiz__option:visible").first().click();
+  await panel.getByRole("button", { name: "Comprobar" }).locator("visible=true").click();
+  await panel.getByRole("button", { name: "Ver el resultado" }).click();
+  await expect(panel).toContainText("Has acertado 2 de 2");
+});
+
+async function login(page: Page): Promise<void> {
+  if (sessionCookies.length > 0) {
+    // Solo las cookies: navegar aqui se pisaba con la navegacion de la prueba
+    await page.context().addCookies(sessionCookies);
+    return;
+  }
+  await page.goto("/studio/login");
+  // Si ya hay sesion, redirige solo
+  if (page.url().endsWith("/studio/")) return;
+  await page.fill("#email", EMAIL);
+  await page.fill("#password", PASSWORD);
+  await page.click('button[type="submit"]');
+  await page.waitForURL("**/studio/");
+  sessionCookies = await page.context().cookies();
+}
+
+test("el sonido de una escena se quita del recorrido publicado desde la barra del lienzo", async ({ page }) => {
+  // «Que el sonido de la escena se pueda silenciar en el editor (no he
+  // encontrado cómo hacerlo)»: silenciar el editor ya estaba; faltaba que
+  // dejara de sonar en el recorrido sin buscar por todo el panel
+  await login(page);
+  await page.goto("/studio/");
+  await page.getByText("Tour E2E").first().click();
+  await page.waitForURL("**/studio/p/**");
+  const projectId = new URL(page.url()).pathname.split("/").filter(Boolean).pop()!;
+  const { scenes: escenas } = (await (await page.request.get(`/api/v1/projects/${projectId}/scenes`)).json()) as { scenes: { id: string; title: string; mediaId: string | null }[] };
+  const escena = escenas.find((s) => s.title === "Escena E2E")!;
+  const patch = await page.request.patch(`/api/v1/projects/${projectId}/scenes/${escena.id}`, {
+    data: { audio: { ambient: { url: `media:${escena.mediaId}` } } },
+    headers: { "x-csrf-token": await csrf(page) },
+  });
+  expect(patch.ok()).toBeTruthy();
+  const compilar = async (): Promise<{ audio?: { ambient?: unknown } } | undefined> => {
+    const res = await page.request.post(`/api/v1/projects/${projectId}/compile`, { data: {}, headers: { "x-csrf-token": await csrf(page) } });
+    const { tour } = (await res.json()) as { tour: { scenes: { id: string; audio?: { ambient?: unknown } }[] } };
+    return tour.scenes.find((s) => s.id === escena.id);
+  };
+  expect((await compilar())?.audio?.ambient).toBeDefined();
+
+  await page.reload();
+  await abrirEscena(page, "Escena E2E");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  // Con sonido propio, junto a «Silenciar» está la flecha del sonido de la escena
+  await expect(page.getByRole("button", { name: "Silenciar el sonido mientras editas" })).toBeVisible();
+  await page.getByRole("button", { name: "Sonido de esta escena en el recorrido" }).click();
+  await page.getByRole("menuitem", { name: "Que no suene en el recorrido publicado" }).click();
+  await expect(page.getByText("Esta escena ya no suena en el recorrido publicado").first()).toBeVisible();
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+  await expect.poll(async () => (await compilar())?.audio?.ambient ?? null, { timeout: 15_000 }).toBeNull();
+
+  // «Abrir el audio de la escena» lleva a la sección, con el interruptor apagado
+  await page.getByRole("button", { name: "Sonido de esta escena en el recorrido" }).click();
+  await page.getByRole("menuitem", { name: "Abrir el audio de la escena" }).click();
+  const interruptor = page.locator("#sc-audio-on");
+  await expect(interruptor).toBeInViewport({ timeout: 10_000 });
+  await expect(interruptor).toHaveAttribute("aria-checked", "false");
+  await expect(page.getByText("Sonido desactivado: esta escena no suena en el recorrido publicado.")).toBeVisible();
+  // Y se vuelve a activar sin haber perdido el fichero
+  await interruptor.click();
+  await expect(page.getByText("Guardado").first()).toBeVisible({ timeout: 15_000 });
+  await expect.poll(async () => (await compilar())?.audio?.ambient ?? null, { timeout: 15_000 }).not.toBeNull();
+
+  // Se deja la escena como estaba para las pruebas siguientes
+  await page.request.patch(`/api/v1/projects/${projectId}/scenes/${escena.id}`, {
+    data: { audio: null },
+    headers: { "x-csrf-token": await csrf(page) },
+  });
+});
+
+test("el plano del visor se abre como minimapa, se amplía y lleva a otra escena", async ({ page }) => {
+  // Se añade un plano al tour publicado al vuelo: el visor no distingue un
+  // tour.json servido de uno modificado en la red
+  await page.route(/\/t\/tour-e2e\/tour\.json/, async (route) => {
+    const res = await route.fetch();
+    const tour = (await res.json()) as {
+      scenes: { id: string; thumbnail?: string; source: { preview?: string; url?: string }; map?: unknown; hotspots: { type: string }[] }[];
+      floorplans?: unknown[];
+      ui?: Record<string, unknown>;
+      treasureHunt?: unknown;
+    };
+    // Sin las compuertas de las pruebas anteriores (tesoro, quiz), que
+    // retendrían al visitante en la escena y no dejarían probar el salto
+    for (const s of tour.scenes) s.hotspots = s.hotspots.filter((h) => !["quiz", "form", "treasure"].includes(h.type));
+    delete tour.treasureHunt;
+    const imagen = tour.scenes[0]!.thumbnail ?? tour.scenes[0]!.source.preview ?? tour.scenes[0]!.source.url!;
+    tour.floorplans = [{ id: "planta-e2e", title: { es: "Planta baja" }, url: imagen }];
+    tour.scenes.forEach((s, i) => {
+      s.map = { floorplan: "planta-e2e", x: 0.25 + 0.5 * (i % 2), y: 0.5 };
+    });
+    tour.ui = { ...tour.ui, floorplanOpen: true };
+    await route.fulfill({ response: res, json: tour });
+  });
+  await page.goto("/t/tour-e2e");
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  const panel = page.locator(".anda-mappanel");
+  await expect(panel).toBeVisible();
+  // Escena actual marcada, con su cono de dirección
+  await expect(panel.locator('.anda-floorplan__marker[aria-current="true"]')).toHaveCount(1);
+  await expect(panel.locator(".anda-floorplan__radar")).toBeVisible();
+  const ancho = (await panel.boundingBox())!.width;
+  await panel.getByRole("button", { name: "Ampliar el plano" }).click();
+  await expect(panel).toHaveClass(/anda-mappanel--big/);
+  expect((await panel.boundingBox())!.width).toBeGreaterThan(ancho * 1.5);
+  const otra = panel.locator('.anda-floorplan__marker[aria-current="false"]').first();
+  if ((await otra.count()) > 0) {
+    const destino = await otra.getAttribute("data-scene");
+    await otra.click();
+    // Tras saltar, vuelve al tamaño de minimapa y marca la escena nueva
+    await expect(panel).not.toHaveClass(/anda-mappanel--big/);
+    await expect(panel.locator(`.anda-floorplan__marker[data-scene="${destino}"]`)).toHaveAttribute("aria-current", "true", { timeout: 15_000 });
+  }
+
+  // En un móvil empieza cerrado y se abre con el botón del mapa
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload();
+  await expect(page.locator(".anda-viewer canvas").first()).toBeVisible({ timeout: 30_000 });
+  await expect(panel).toBeHidden();
+  await page.locator(".anda-controls-left").getByRole("button", { name: "Mapa" }).click();
+  await expect(panel).toBeVisible();
+});
