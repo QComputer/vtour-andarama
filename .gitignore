@@ -30,3 +30,10 @@ __pycache__/
 # Material no técnico: se queda en local, nunca en el repo público
 docs/seo/
 tooling/seo/
+
+# secrets
+docker/.env
+.env
+*.db
+storage/
+
