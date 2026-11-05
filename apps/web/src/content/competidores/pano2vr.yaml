@@ -1,0 +1,38 @@
+nombre: Pano2VR
+web: https://ggnome.com/pano2vr/
+pais: "AT"
+tipo: desktop
+gratis: false
+gratis_detalle: "Versión de prueba sin límite de tiempo, con marca de agua y límite de nodos; no hay plan gratuito"
+planes:
+  - nombre: Pano2VR 8 (licencia perpetua)
+    precio: 499
+    moneda: EUR
+    periodo: once
+    precio_mes_anual: null
+    precio_anual: null
+    verificado: true
+  - nombre: Pano2VR (suscripción)
+    precio: 360
+    moneda: EUR
+    periodo: year
+    precio_mes_anual: 30
+    precio_anual: 360
+    verificado: true
+cuotas: "Sin límite de proyectos (licencia de escritorio); el alojamiento corre por cuenta del usuario"
+rv: true
+scorm: false
+lti: false
+exportacion: true
+exportacion_detalle: "Genera HTML5 autónomo para alojarlo en cualquier servidor"
+codigo_abierto: false
+marca_blanca: true
+dominio_propio: true
+analitica_sin_cookies: null
+street_view: true
+verificado: true
+fecha_verificacion: 2026-09-27
+descripcion:
+  es: "Software de escritorio de Garden Gnome (Austria), con licencia perpetua o suscripción, potente y técnico, apreciado por fotógrafos de panoramas."
+  en: "Desktop software by Garden Gnome (Austria), with a perpetual licence or a subscription, powerful and technical, popular with panorama photographers."
+notas: "Ya no hay ediciones «normal» y «pro»: la versión 8 se vende como licencia perpetua a 499 € (400 € por cada usuario adicional) o como suscripción a 360 € al año o 120 € al trimestre, con acceso siempre a la última versión. Precios sin IVA. La página de producto no menciona descuento educativo. Exporta a WebXR y publica en Google Street View. Sin funciones de LMS ni SCORM. Fuente: https://ggnome.com/pano2vr/ (27-9-2026)."

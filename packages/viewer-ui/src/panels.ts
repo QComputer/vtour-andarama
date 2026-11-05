@@ -1,0 +1,1217 @@
+import type {
+  AudioHotspot,
+  CompareHotspot,
+  EmbedVideoHotspot,
+  FormHotspot,
+  GalleryHotspot,
+  Hotspot,
+  ImageHotspot,
+  Model3dHotspot,
+  PdfHotspot,
+  QuizHotspot,
+  QuizQuestion,
+  TextHotspot,
+  TreasureHotspot,
+  VideoFileHotspot,
+  WebHotspot,
+} from "@andarama/schema";
+import { isQuizAnswerCorrect, quizQuestionPoints, quizQuestions } from "@andarama/schema";
+import { resolveUrl, TourViewer, type VrPdfDocument } from "@andarama/viewer";
+import { el, trapFocus } from "./dom.js";
+import { renderMarkdown } from "./markdown.js";
+import { createIconSvg, LABEL_EXPAND_EVENT, type LabelExpandDetail } from "@andarama/viewer";
+import type { Translator } from "./i18n.js";
+import { parseVideoRef } from "./video.js";
+import { embedFileName, embedSource } from "./embed.js";
+import { rememberFormSent, visitorId, wasFormSent } from "./visitor.js";
+
+export interface PanelContext {
+  viewer: TourViewer;
+  t: Translator;
+  baseUrl: string;
+  container: HTMLElement;
+  /** Endpoint de la API de formularios (null en export sin backend). */
+  formEndpoint: string | null;
+  turnstileSiteKey: string | null;
+  onClose: () => void;
+}
+
+/**
+ * Host de paneles: lightbox accesible (dialog + trampa de foco + Esc)
+ * que renderiza el contenido segun el tipo de hotspot.
+ */
+export class PanelHost {
+  private backdrop: HTMLElement | null = null;
+  private releaseFocus: (() => void) | null = null;
+  private lastFocus: HTMLElement | null = null;
+  private bubbleCleanup: (() => void) | null = null;
+  private bubbleId: string | null = null;
+  /** Hotspot del panel modal abierto. */
+  private modalId: string | null = null;
+  /** Último hotspot avisado a onPanelChange. */
+  private notifiedId: string | null = null;
+
+  /**
+   * Avisa al abrir o cerrar el panel de un hotspot (modal o burbuja de
+   * tooltip; no la del texto entero de una etiqueta). La visita guiada lo usa
+   * para abrir lo mismo a quienes siguen al guía.
+   */
+  onPanelChange: ((hotspotId: string | null) => void) | null = null;
+
+  constructor(private ctx: Omit<PanelContext, "onClose">) {
+    // Una etiqueta cortada pide su texto entero: la misma burbuja desplazable
+    // que los tooltips, anclada al marcador
+    ctx.container.addEventListener(LABEL_EXPAND_EVENT, (e) => {
+      const d = (e as CustomEvent<LabelExpandDetail>).detail;
+      if (d != null) this.showBubble(`label:${d.hotspotId}`, d.text, d.anchor, false);
+    });
+  }
+
+  get isOpen(): boolean {
+    return this.backdrop != null;
+  }
+
+  /** Hotspot cuyo panel (o burbuja de tooltip) está abierto. */
+  get openHotspotId(): string | null {
+    if (this.modalId != null) return this.modalId;
+    return this.bubbleId != null && !this.bubbleId.startsWith("label:") ? this.bubbleId : null;
+  }
+
+  private syncPanelChange(): void {
+    const id = this.openHotspotId;
+    if (id === this.notifiedId) return;
+    this.notifiedId = id;
+    this.onPanelChange?.(id);
+  }
+
+  close(): void {
+    this.closeModal();
+    this.syncPanelChange();
+  }
+
+  private closeModal(): void {
+    this.releaseFocus?.();
+    this.releaseFocus = null;
+    this.backdrop?.remove();
+    this.backdrop = null;
+    this.modalId = null;
+    this.lastFocus?.focus();
+    this.lastFocus = null;
+  }
+
+  open(hotspot: Hotspot, anchor: HTMLElement | null): void {
+    // Sin avisar del cierre: se avisa una vez, de lo que queda abierto
+    this.closeModal();
+    try {
+      this.openInner(hotspot, anchor);
+    } finally {
+      this.syncPanelChange();
+    }
+  }
+
+  private openInner(hotspot: Hotspot, anchor: HTMLElement | null): void {
+    // Un tooltip es una burbuja anclada al marcador, no un modal.
+    if (hotspot.type === "tooltip" && anchor != null) {
+      this.openTooltip(hotspot, anchor);
+      return;
+    }
+    this.lastFocus = (anchor ?? document.activeElement) as HTMLElement | null;
+    const ctx: PanelContext = { ...this.ctx, onClose: () => this.close() };
+    const content = buildPanelContent(hotspot, ctx);
+    if (content == null) return;
+
+    const title = this.ctx.viewer.text(hotspot.label) || this.ctx.viewer.text((hotspot as { title?: unknown }).title as any) || "";
+    const closeBtn = el("button", {
+      className: "anda-btn",
+      type: "button",
+      "aria-label": this.ctx.t("close"),
+      // Accionable con la mirada: con el giroscopio puesto no hay dedo que
+      // valga, y un panel que se abre pero no se cierra es una trampa.
+      "data-gaze": "1",
+    });
+    closeBtn.appendChild(createIconSvg("x", 20));
+    closeBtn.addEventListener("click", () => this.close());
+
+    const panel = el(
+      "div",
+      {
+        className: `anda-panel${content.wide === true ? " anda-panel--wide" : ""}`,
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": title || hotspot.type,
+      },
+      el("div", { className: "anda-panel__head" }, el("h2", { text: title || " " }), closeBtn),
+      content.body,
+    );
+    this.backdrop = el("div", { className: "anda-panel-backdrop" }, panel);
+    this.backdrop.addEventListener("click", (e) => {
+      if (e.target === this.backdrop) this.close();
+    });
+    this.ctx.container.appendChild(this.backdrop);
+    this.modalId = hotspot.id;
+    this.releaseFocus = trapFocus(this.backdrop, () => this.close());
+    closeBtn.focus();
+    content.onMounted?.();
+  }
+
+  /** Cierra la burbuja abierta (tooltip o texto entero de una etiqueta). */
+  closeBubble(): void {
+    this.bubbleCleanup?.();
+    this.bubbleCleanup = null;
+    this.bubbleId = null;
+    this.syncPanelChange();
+  }
+
+  /** Burbuja de tooltip pegada al marcador; se cierra sola al mover la vista. */
+  private openTooltip(hotspot: Hotspot, anchor: HTMLElement): void {
+    const text = this.ctx.viewer.text((hotspot as { text?: unknown }).text as never) || this.ctx.viewer.text(hotspot.label);
+    this.showBubble(hotspot.id, text, anchor, (hotspot as { permanent?: boolean }).permanent === true);
+  }
+
+  /**
+   * Burbuja anclada con un texto: la de los tooltips y la del texto entero de
+   * una etiqueta cortada. Pulsar otra vez lo mismo la cierra.
+   */
+  private showBubble(id: string, text: string, anchor: HTMLElement, permanent: boolean): void {
+    if (text === "") return;
+    const repetida = this.bubbleId === id;
+    // Quitar la anterior con su limpieza: antes se borraba el nodo y sus
+    // escuchas de viewChange seguían vivas
+    this.closeBubble();
+    if (repetida) return;
+    const bubble = el("div", { className: "anda-tooltip-bubble", role: "status", "data-for": id, text });
+    this.ctx.container.appendChild(bubble);
+    // La burbuja se mide con el visor, no con la pantalla: si el texto no
+    // cabe encima del marcador se abre debajo, y si tampoco, se desplaza por
+    // dentro (rueda, dedo o teclado). Antes un texto largo se salía por
+    // arriba y no había forma de leerlo.
+    const place = (): void => {
+      const cRect = this.ctx.container.getBoundingClientRect();
+      const aRect = anchor.getBoundingClientRect();
+      const margen = 8;
+      const alto = bubble.offsetHeight;
+      const ancho = bubble.offsetWidth;
+      const arriba = aRect.top - cRect.top - 10;
+      const abajo = aRect.bottom - cRect.top + 10;
+      const debajo = arriba - alto < margen && abajo + alto <= cRect.height - margen;
+      bubble.classList.toggle("anda-tooltip-bubble--below", debajo);
+      bubble.classList.toggle("anda-tooltip-bubble--scroll", bubble.scrollHeight > bubble.clientHeight + 1);
+      const centro = aRect.left - cRect.left + aRect.width / 2;
+      const mitad = ancho / 2;
+      const x = Math.min(Math.max(centro, mitad + margen), Math.max(mitad + margen, cRect.width - mitad - margen));
+      bubble.style.left = `${x}px`;
+      bubble.style.top = `${debajo ? abajo : Math.max(arriba, alto + margen)}px`;
+    };
+    place();
+    if (bubble.scrollHeight > bubble.clientHeight + 1) bubble.tabIndex = 0;
+    const offView = this.ctx.viewer.on("viewChange", place);
+    const offScene = this.ctx.viewer.on("sceneChange", () => cleanup());
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = (): void => {
+      offView();
+      offScene();
+      if (timer != null) clearTimeout(timer);
+      bubble.remove();
+      if (this.bubbleCleanup === cleanup) {
+        this.bubbleCleanup = null;
+        this.bubbleId = null;
+        this.syncPanelChange();
+      }
+    };
+    this.bubbleCleanup = cleanup;
+    this.bubbleId = id;
+    if (!permanent) {
+      // Tiempo de lectura según la longitud; leer o desplazar lo alarga
+      const lectura = Math.min(30000, 6000 + text.length * 45);
+      const armar = (): void => {
+        if (timer != null) clearTimeout(timer);
+        timer = setTimeout(cleanup, lectura);
+      };
+      armar();
+      for (const evt of ["pointerenter", "pointerdown", "scroll", "wheel", "touchstart", "focus"]) {
+        bubble.addEventListener(evt, armar, { passive: true });
+      }
+    }
+  }
+}
+
+interface PanelContent {
+  body: HTMLElement;
+  wide?: boolean;
+  onMounted?: () => void;
+}
+
+function buildPanelContent(hotspot: Hotspot, ctx: PanelContext): PanelContent | null {
+  switch (hotspot.type) {
+    case "text":
+      return textPanel(hotspot, ctx);
+    case "image":
+      return imagePanel(hotspot, ctx);
+    case "gallery":
+      return galleryPanel(hotspot, ctx);
+    case "videoFile":
+      return videoPanel(hotspot, ctx);
+    case "embedVideo":
+      return embedPanel(hotspot, ctx);
+    case "audio":
+      return audioPanel(hotspot, ctx);
+    case "pdf":
+      return pdfPanel(hotspot, ctx);
+    case "model3d":
+      return modelPanel(hotspot, ctx);
+    case "web":
+      return webPanel(hotspot, ctx);
+    case "form":
+      return formPanel(hotspot, ctx);
+    case "compare":
+      return comparePanel(hotspot, ctx);
+    case "quiz":
+      return quizPanel(hotspot, ctx);
+    case "tooltip":
+      return textPanel({ ...hotspot, type: "text", body: hotspot.text } as unknown as TextHotspot, ctx);
+    case "treasure":
+      return treasurePanel(hotspot, ctx);
+    default:
+      return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Tesoro encontrado. El propio hotspot lleva lo que se lee al hallarlo; si no
+ * lleva nada, el visor felicita igual, porque encontrarlo ya es el premio.
+ */
+function treasurePanel(hs: TreasureHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body anda-treasure-found" });
+  const icono = createIconSvg("gem", 44, "currentColor");
+  icono.classList.add("anda-treasure-found__icon");
+  body.appendChild(icono);
+  const titulo = el("p", { className: "anda-treasure-found__title" });
+  titulo.textContent = ctx.viewer.text(hs.label) || ctx.t("treasure_found");
+  body.appendChild(titulo);
+  const premio = ctx.viewer.text(hs.reward);
+  if (premio !== "") {
+    const prosa = el("div", { className: "anda-prose" });
+    prosa.innerHTML = renderMarkdown(premio);
+    body.appendChild(prosa);
+  }
+  const estado = ctx.viewer.treasureState();
+  if (estado.total > 0) {
+    const cuenta = el("p", { className: "anda-treasure-found__count" });
+    cuenta.textContent = ctx.t("treasure_progress", { found: String(estado.found), total: String(estado.total) });
+    body.appendChild(cuenta);
+    // El último: el mensaje final va aquí, en el panel que se está leyendo, y
+    // no en un aviso de dos segundos que el propio panel tapaba.
+    if (estado.found >= estado.total) {
+      const final = el("p", { className: "anda-treasure-found__done" });
+      final.textContent = ctx.viewer.text(ctx.viewer.tour.treasureHunt?.completionMessage) || ctx.t("treasure_complete_all");
+      body.appendChild(final);
+    }
+  }
+  return { body };
+}
+
+function textPanel(hs: TextHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body" });
+  // El tamaño de letra lo decide el autor por panel: una cartela de museo
+  // que se lee de pie no es un pie de foto.
+  const size = hs.fontSize != null && hs.fontSize !== "normal" ? ` anda-prose--${hs.fontSize}` : "";
+  const prose = el("div", { className: `anda-prose${size}` });
+  prose.innerHTML = renderMarkdown(ctx.viewer.text(hs.body));
+  body.appendChild(prose);
+  return { body };
+}
+
+function imagePanel(hs: ImageHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body anda-panel__body--flush" });
+  const zoom = el("div", { className: "anda-deepzoom" });
+  const img = el("img", { src: resolveUrl(ctx.baseUrl, hs.url), alt: ctx.viewer.text(hs.altText) });
+  zoom.appendChild(img);
+  body.appendChild(zoom);
+  const caption = ctx.viewer.text(hs.caption);
+  if (caption !== "") body.appendChild(el("div", { className: "anda-deepzoom__caption", text: caption }));
+  if (hs.download === true) {
+    const bar = el("div", { className: "anda-deepzoom__caption" });
+    const a = el("a", { href: resolveUrl(ctx.baseUrl, hs.url), download: "", text: ctx.t("download") });
+    a.style.color = "var(--u3-primary)";
+    bar.appendChild(a);
+    body.appendChild(bar);
+  }
+  return { body, wide: true, onMounted: () => setupDeepZoom(zoom, img) };
+}
+
+/** Pan/zoom profundo con rueda, arrastre y pellizco. */
+function setupDeepZoom(viewport: HTMLElement, img: HTMLImageElement): void {
+  let scale = 1;
+  let tx = 0;
+  let ty = 0;
+  let natW = 0;
+  let natH = 0;
+
+  const apply = (): void => {
+    img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+  };
+  const fit = (): void => {
+    const vw = viewport.clientWidth;
+    const vh = viewport.clientHeight;
+    if (natW === 0 || vw === 0) return;
+    scale = Math.min(vw / natW, vh / natH);
+    tx = (vw - natW * scale) / 2;
+    ty = (vh - natH * scale) / 2;
+    apply();
+  };
+  img.addEventListener("load", () => {
+    natW = img.naturalWidth;
+    natH = img.naturalHeight;
+    fit();
+  });
+  if (img.complete && img.naturalWidth > 0) {
+    natW = img.naturalWidth;
+    natH = img.naturalHeight;
+    setTimeout(fit, 0);
+  }
+  viewport.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      const rect = viewport.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const factor = e.deltaY < 0 ? 1.2 : 1 / 1.2;
+      const ns = Math.min(8, Math.max(0.05, scale * factor));
+      tx = cx - ((cx - tx) / scale) * ns;
+      ty = cy - ((cy - ty) / scale) * ns;
+      scale = ns;
+      apply();
+    },
+    { passive: false },
+  );
+  let dragging = false;
+  let lastX = 0;
+  let lastY = 0;
+  const pointers = new Map<number, { x: number; y: number }>();
+  let pinchDist = 0;
+  viewport.addEventListener("pointerdown", (e) => {
+    viewport.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) {
+      dragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+    } else if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      pinchDist = Math.hypot(a!.x - b!.x, a!.y - b!.y);
+    }
+  });
+  viewport.addEventListener("pointermove", (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      const d = Math.hypot(a!.x - b!.x, a!.y - b!.y);
+      if (pinchDist > 0) {
+        const factor = d / pinchDist;
+        scale = Math.min(8, Math.max(0.05, scale * factor));
+        pinchDist = d;
+        apply();
+      }
+    } else if (dragging) {
+      tx += e.clientX - lastX;
+      ty += e.clientY - lastY;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      apply();
+    }
+  });
+  const up = (e: PointerEvent): void => {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinchDist = 0;
+    if (pointers.size === 0) dragging = false;
+  };
+  viewport.addEventListener("pointerup", up);
+  viewport.addEventListener("pointercancel", up);
+  viewport.addEventListener("dblclick", () => {
+    scale = scale > 1 ? 1 : 2;
+    fit();
+    if (scale !== 1) {
+      scale = 2;
+      apply();
+    }
+  });
+}
+
+function galleryPanel(hs: GalleryHotspot, ctx: PanelContext): PanelContent {
+  let index = 0;
+  const body = el("div", { className: "anda-panel__body anda-panel__body--flush" });
+  const wrap = el("div", { className: "anda-gallery" });
+  const main = el("img", { className: "anda-gallery__main", alt: "" });
+  const meta = el("div", { className: "anda-gallery__meta" });
+  const thumbs = el("div", { className: "anda-gallery__thumbs", role: "tablist" });
+
+  const show = (i: number): void => {
+    index = (i + hs.items.length) % hs.items.length;
+    const item = hs.items[index]!;
+    main.src = resolveUrl(ctx.baseUrl, item.url);
+    main.alt = ctx.viewer.text(item.title);
+    meta.replaceChildren(
+      el("strong", { text: ctx.viewer.text(item.title) }),
+      el("p", { text: ctx.viewer.text(item.description), style: "margin:4px 0 0;color:var(--u3-fg-dim);font-size:14px;" }),
+    );
+    thumbs.querySelectorAll("img").forEach((t, j) => {
+      t.setAttribute("aria-current", j === index ? "true" : "false");
+    });
+  };
+  const prev = el("button", { className: "anda-btn anda-gallery__nav anda-gallery__nav--prev", "aria-label": ctx.t("gallery_prev") });
+  prev.appendChild(createIconSvg("chevron-left", 20));
+  prev.addEventListener("click", () => show(index - 1));
+  const next = el("button", { className: "anda-btn anda-gallery__nav anda-gallery__nav--next", "aria-label": ctx.t("gallery_next") });
+  next.appendChild(createIconSvg("chevron-right", 20));
+  next.addEventListener("click", () => show(index + 1));
+
+  hs.items.forEach((item, i) => {
+    const t = el("img", { src: resolveUrl(ctx.baseUrl, item.thumb ?? item.url), alt: ctx.viewer.text(item.title), role: "tab" });
+    t.addEventListener("click", () => show(i));
+    thumbs.appendChild(t);
+  });
+  wrap.append(main, prev, next);
+  body.append(wrap, meta, thumbs);
+  show(0);
+  return { body, wide: true };
+}
+
+function videoPanel(hs: VideoFileHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body anda-panel__body--flush" });
+  const video = el("video", {
+    controls: true,
+    playsinline: true,
+    style: "width:100%;max-height:70vh;display:block;background:#000;",
+  });
+  video.src = resolveUrl(ctx.baseUrl, hs.url);
+  if (hs.autoplay === true) {
+    video.muted = hs.muted ?? true;
+    video.autoplay = true;
+  }
+  video.loop = hs.loop ?? false;
+  for (const track of hs.subtitles ?? []) {
+    const t = el("track", { kind: "subtitles", srclang: track.lang, src: resolveUrl(ctx.baseUrl, track.url) });
+    video.appendChild(t);
+  }
+  body.appendChild(video);
+  return { body, wide: true };
+}
+
+function embedPanel(hs: EmbedVideoHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body anda-panel__body--flush" });
+  let src = "";
+  const nocookie = hs.nocookie !== false;
+  // Se acepta tanto el ID como la dirección completa del vídeo: es lo que la
+  // gente copia, y un tour antiguo con la URL pegada tiene que seguir sonando.
+  const ref = parseVideoRef(hs.provider, hs.videoId) ?? { id: hs.videoId };
+  const start = hs.start ?? ref.start;
+  if (hs.provider === "youtube") {
+    const host = nocookie ? "www.youtube-nocookie.com" : "www.youtube.com";
+    const params = new URLSearchParams();
+    if (hs.autoplay === true) params.set("autoplay", "1");
+    if (start != null && start > 0) params.set("start", String(start));
+    src = `https://${host}/embed/${encodeURIComponent(ref.id)}?${params.toString()}`;
+  } else if (hs.provider === "vimeo") {
+    const params = new URLSearchParams({ dnt: "1" });
+    if (hs.autoplay === true) params.set("autoplay", "1");
+    src = `https://player.vimeo.com/video/${encodeURIComponent(ref.id)}?${params.toString()}`;
+  } else {
+    const host = (hs.host ?? "").replace(/\/$/, "");
+    src = `${host}/videos/embed/${encodeURIComponent(hs.videoId)}`;
+  }
+  const iframe = el("iframe", {
+    src,
+    allow: "accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture; fullscreen",
+    allowfullscreen: true,
+    style: "width:100%;aspect-ratio:16/9;border:0;display:block;",
+    title: ctx.viewer.text(hs.label) || "Video",
+  });
+  body.appendChild(iframe);
+  return { body, wide: true };
+}
+
+function audioPanel(hs: AudioHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body" });
+  const audio = el("audio", { controls: true, style: "width:100%;" });
+  audio.src = resolveUrl(ctx.baseUrl, hs.url);
+  audio.loop = hs.loop ?? false;
+  if (hs.volume != null) audio.volume = hs.volume;
+  body.appendChild(audio);
+  const transcript = ctx.viewer.text(hs.transcript);
+  if (transcript !== "") {
+    const details = el("details", { style: "margin-top:12px;" });
+    details.appendChild(el("summary", { text: ctx.t("transcript") }));
+    const prose = el("div", { className: "anda-prose" });
+    prose.innerHTML = renderMarkdown(transcript);
+    details.appendChild(prose);
+    body.appendChild(details);
+  }
+  void audio.play().catch(() => {});
+  return { body };
+}
+
+function pdfPanel(hs: PdfHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body anda-panel__body--flush" });
+  const holder = el("div", { style: "min-height:60vh;display:flex;flex-direction:column;" });
+  body.appendChild(holder);
+  const url = resolveUrl(ctx.baseUrl, hs.url);
+  return {
+    body,
+    wide: true,
+    onMounted: () => {
+      void renderPdf(holder, url, ctx).catch(() => {
+        // Fallback: visor nativo del navegador.
+        holder.replaceChildren(
+          el("iframe", { src: url, style: "flex:1;border:0;min-height:60vh;", title: "PDF" }),
+        );
+      });
+      if (hs.download === true) {
+        const bar = el("div", { style: "padding:10px 16px;" });
+        const a = el("a", { href: url, download: "", text: ctx.t("download") });
+        a.style.color = "var(--u3-primary)";
+        bar.appendChild(a);
+        body.appendChild(bar);
+      }
+    },
+  };
+}
+
+/** Abre un PDF con pdf.js (chunk y worker de carga perezosa). */
+async function openPdf(url: string): Promise<any> {
+  const pdfjs: any = await import(/* @vite-ignore */ "pdfjs-dist" as string);
+  if (pdfjs.GlobalWorkerOptions != null) {
+    try {
+      pdfjs.GlobalWorkerOptions.workerSrc = new URL("./pdf.worker.min.mjs", import.meta.url).toString();
+    } catch {
+      // el bundler resolvera el worker
+    }
+  }
+  return pdfjs.getDocument(url).promise;
+}
+
+/**
+ * El mismo PDF.js para el panel del modo inmersivo: cada página se dibuja
+ * en un lienzo del ancho pedido y el motor VR la pinta en su panel.
+ */
+export async function openPdfForVr(url: string): Promise<VrPdfDocument> {
+  const doc = await openPdf(url);
+  return {
+    numPages: doc.numPages as number,
+    async renderPage(pageNumber: number, width: number): Promise<HTMLCanvasElement> {
+      const page = await doc.getPage(pageNumber);
+      const base = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({ scale: width / base.width });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const g = canvas.getContext("2d")!;
+      // Fondo blanco: las páginas sin fondo saldrían transparentes en el panel
+      g.fillStyle = "#fff";
+      g.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: g, viewport }).promise;
+      page.cleanup?.();
+      return canvas;
+    },
+    destroy: () => void doc.destroy?.(),
+  };
+}
+
+/** Visor PDF.js con paginacion y zoom (carga perezosa del chunk). */
+async function renderPdf(holder: HTMLElement, url: string, ctx: PanelContext): Promise<void> {
+  const doc = await openPdf(url);
+  let page = 1;
+  let zoom = 1.2;
+  const canvas = el("canvas", { style: "display:block;margin:0 auto;max-width:100%;" });
+  const status = el("span", { style: "flex:1;text-align:center;font-size:13px;" });
+  const render = async (): Promise<void> => {
+    const p = await doc.getPage(page);
+    const viewport = p.getViewport({ scale: zoom });
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await p.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    status.textContent = ctx.t("pdf_page", { page, total: doc.numPages });
+  };
+  const btn = (icon: string, label: string, fn: () => void): HTMLButtonElement => {
+    const b = el("button", { className: "anda-btn", "aria-label": label, style: "width:36px;height:36px;" });
+    b.appendChild(createIconSvg(icon, 16));
+    b.addEventListener("click", fn);
+    return b;
+  };
+  const bar = el(
+    "div",
+    { style: "display:flex;gap:6px;align-items:center;padding:8px 12px;border-bottom:1px solid rgba(128,128,160,.25);" },
+    btn("chevron-left", ctx.t("gallery_prev"), () => {
+      if (page > 1) {
+        page--;
+        void render();
+      }
+    }),
+    btn("chevron-right", ctx.t("gallery_next"), () => {
+      if (page < doc.numPages) {
+        page++;
+        void render();
+      }
+    }),
+    status,
+    btn("minus", ctx.t("zoom_out"), () => {
+      zoom = Math.max(0.4, zoom / 1.25);
+      void render();
+    }),
+    btn("plus", ctx.t("zoom_in"), () => {
+      zoom = Math.min(4, zoom * 1.25);
+      void render();
+    }),
+  );
+  const scroller = el("div", { style: "flex:1;overflow:auto;background:#333;padding:12px;" }, canvas);
+  holder.replaceChildren(bar, scroller);
+  await render();
+}
+
+function modelPanel(hs: Model3dHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body anda-panel__body--flush" });
+  const holder = el("div", { style: "height:60vh;background:#1a1a2a;" });
+  body.appendChild(holder);
+  if (hs.format === "obj" || hs.format === "stl") {
+    return {
+      body,
+      wide: true,
+      onMounted: () => {
+        void renderThreeModel(holder, resolveUrl(ctx.baseUrl, hs.url), hs.format as "obj" | "stl", ctx).catch(() => {
+          holder.textContent = ctx.t("error_load");
+        });
+      },
+    };
+  }
+  return {
+    body,
+    wide: true,
+    onMounted: () => {
+      void (async () => {
+        try {
+          await import(/* @vite-ignore */ "@google/model-viewer" as string);
+        } catch {
+          holder.textContent = ctx.t("error_load");
+          return;
+        }
+        const mv = document.createElement("model-viewer") as HTMLElement & Record<string, unknown>;
+        mv.setAttribute("src", resolveUrl(ctx.baseUrl, hs.url));
+        mv.setAttribute("camera-controls", "");
+        mv.setAttribute("auto-rotate", "");
+        mv.setAttribute("shadow-intensity", "1");
+        mv.setAttribute("style", "width:100%;height:100%;");
+        mv.setAttribute("alt", ctx.viewer.text(hs.altText));
+        if (hs.poster != null) mv.setAttribute("poster", resolveUrl(ctx.baseUrl, hs.poster));
+        if (hs.ar === true) {
+          mv.setAttribute("ar", "");
+          mv.setAttribute("ar-modes", "scene-viewer quick-look webxr");
+          if (hs.usdz != null) mv.setAttribute("ios-src", resolveUrl(ctx.baseUrl, hs.usdz));
+        }
+        holder.replaceChildren(mv);
+      })();
+    },
+  };
+}
+
+/** Modelos OBJ/STL con three.js (carga perezosa; glTF/GLB usan model-viewer). */
+async function renderThreeModel(holder: HTMLElement, url: string, format: "obj" | "stl", ctx: PanelContext): Promise<void> {
+  const [three, controlsMod, loaderMod] = await Promise.all([
+    import(/* @vite-ignore */ "three" as string),
+    import(/* @vite-ignore */ "three/examples/jsm/controls/OrbitControls.js" as string),
+    format === "obj"
+      ? import(/* @vite-ignore */ "three/examples/jsm/loaders/OBJLoader.js" as string)
+      : import(/* @vite-ignore */ "three/examples/jsm/loaders/STLLoader.js" as string),
+  ]);
+  const THREE: any = three;
+  const width = holder.clientWidth || 800;
+  const height = holder.clientHeight || 480;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a2a);
+  const camera = new THREE.PerspectiveCamera(50, width / height, 0.01, 1000);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(width, height);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  holder.replaceChildren(renderer.domElement);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+  const dir = new THREE.DirectionalLight(0xffffff, 1.4);
+  dir.position.set(3, 5, 4);
+  scene.add(dir);
+
+  const material = new THREE.MeshStandardMaterial({ color: 0xb8bdd0, metalness: 0.1, roughness: 0.7 });
+  let object: any;
+  if (format === "obj") {
+    const loader = new (loaderMod as any).OBJLoader();
+    object = await loader.loadAsync(url);
+    object.traverse((child: any) => {
+      if (child.isMesh && child.material?.map == null) child.material = material;
+    });
+  } else {
+    const loader = new (loaderMod as any).STLLoader();
+    const geometry = await loader.loadAsync(url);
+    geometry.computeVertexNormals();
+    object = new THREE.Mesh(geometry, material);
+  }
+  // Centrar y encuadrar
+  const box = new THREE.Box3().setFromObject(object);
+  const size = box.getSize(new THREE.Vector3()).length() || 1;
+  const center = box.getCenter(new THREE.Vector3());
+  object.position.sub(center);
+  scene.add(object);
+  camera.position.set(size * 0.7, size * 0.5, size * 0.9);
+  const controls = new (controlsMod as any).OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.autoRotate = true;
+  controls.autoRotateSpeed = 1.2;
+  let alive = true;
+  const tick = (): void => {
+    if (!alive) return;
+    if (!document.contains(holder)) {
+      alive = false;
+      renderer.dispose();
+      return;
+    }
+    controls.update();
+    renderer.render(scene, camera);
+    requestAnimationFrame(tick);
+  };
+  tick();
+  void ctx;
+}
+
+function webPanel(hs: WebHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body anda-panel__body--flush" });
+  // Sandbox estricto por defecto: allow-scripts + allow-same-origin juntos
+  // anulan el aislamiento, asi que same-origin es opt-in explicito.
+  const sandbox = Array.isArray(hs.sandbox)
+    ? hs.sandbox.join(" ")
+    : (hs.sandbox as unknown) === "permissive"
+      ? "allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
+      : "allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox";
+  const title = ctx.viewer.text(hs.label) || "Web";
+  const height = hs.height ?? 480;
+  // Código de inserción: si es un iframe suelto (Sketchfab, Maps, Genially…)
+  // se usa su fuente tal cual; si trae más, el documento aparte del paquete.
+  const html = typeof hs.html === "string" && hs.html.trim() !== "" ? hs.html : null;
+  const fuente = html != null ? embedSource(html) : null;
+  let src = hs.url;
+  let allow = (hs.allow ?? []).join("; ");
+  let allowFullscreen = false;
+  let externo: string | null = hs.url !== "" && hs.url !== "https://" ? hs.url : null;
+  if (fuente != null) {
+    src = fuente.src;
+    allow = fuente.allow ?? "autoplay; fullscreen; xr-spatial-tracking; accelerometer; gyroscope";
+    allowFullscreen = fuente.allowFullscreen;
+    externo = fuente.src;
+  } else if (html != null) {
+    src = resolveUrl(ctx.baseUrl, embedFileName(hs.id));
+    allow = "autoplay; fullscreen; xr-spatial-tracking; accelerometer; gyroscope";
+    allowFullscreen = true;
+    externo = null;
+  }
+  const iframe = el("iframe", {
+    src,
+    sandbox,
+    allow,
+    allowfullscreen: allowFullscreen,
+    style: `width:100%;height:${height}px;border:0;display:block;`,
+    title,
+    referrerpolicy: "no-referrer",
+  });
+  body.appendChild(iframe);
+  // Muchas webs se niegan a cargar dentro de otra (X-Frame-Options): no se
+  // puede saber desde fuera, así que el enlace a la pestaña está siempre.
+  if (externo != null) {
+    const pie = el("div", { className: "anda-web__foot" });
+    pie.appendChild(el("span", { text: ctx.t("web_blocked_hint"), style: "flex:1;" }));
+    pie.appendChild(el("a", { href: externo, target: "_blank", rel: "noopener noreferrer", text: ctx.t("web_open_external") }));
+    body.appendChild(pie);
+  }
+  return { body, wide: true };
+}
+
+function formPanel(hs: FormHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body" });
+  // De un solo envío y ya enviado (en esta visita o en otra): se dice y
+  // no se vuelve a pintar el formulario. Reabrir el hotspot ya no lo duplica.
+  if (hs.once === true && (wasFormSent(hs.id) || ctx.viewer.formSubmitted(hs.id))) {
+    ctx.viewer.markFormSubmitted(hs.id);
+    body.appendChild(el("p", { className: "anda-prose anda-form__done", text: ctx.t("form_already_sent") }));
+    return { body };
+  }
+  const form = el("form", { className: "anda-form", novalidate: true });
+  const fields: { id: string; input: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement; required: boolean }[] = [];
+
+  for (const field of hs.fields) {
+    const label = el("label", { for: `u3f-${field.id}`, text: ctx.viewer.text(field.label) + (field.required === true ? " *" : "") });
+    form.appendChild(label);
+    let input: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+    if (field.type === "select") {
+      input = el("select", { id: `u3f-${field.id}` });
+      for (const opt of field.options ?? []) {
+        input.appendChild(el("option", { value: opt.value, text: ctx.viewer.text(opt.label) }));
+      }
+    } else if (field.type === "textarea") {
+      input = el("textarea", { id: `u3f-${field.id}`, rows: "4" });
+    } else if (field.type === "checkbox") {
+      const wrap = el("div", { className: "anda-check" });
+      input = el("input", { type: "checkbox", id: `u3f-${field.id}` });
+      wrap.append(input);
+      form.removeChild(label);
+      wrap.appendChild(el("label", { for: `u3f-${field.id}`, text: ctx.viewer.text(field.label), style: "margin:0;" }));
+      form.appendChild(wrap);
+    } else {
+      input = el("input", { type: field.type, id: `u3f-${field.id}` });
+    }
+    const ph = ctx.viewer.text(field.placeholder);
+    if (ph !== "" && "placeholder" in input) (input as HTMLInputElement).placeholder = ph;
+    if (input.parentElement == null) form.appendChild(input);
+    fields.push({ id: field.id, input, required: field.required === true });
+  }
+
+  let turnstileToken: string | null = null;
+  if (hs.turnstile === true && ctx.turnstileSiteKey != null) {
+    const holder = el("div", { style: "margin-top:14px;" });
+    form.appendChild(holder);
+    const w = window as unknown as Record<string, any>;
+    const renderTs = (): void => {
+      w.turnstile?.render(holder, {
+        sitekey: ctx.turnstileSiteKey,
+        callback: (token: string) => {
+          turnstileToken = token;
+        },
+      });
+    };
+    if (w.turnstile != null) renderTs();
+    else {
+      const script = el("script", { src: "https://challenges.cloudflare.com/turnstile/v0/api.js" });
+      script.addEventListener("load", renderTs);
+      document.head.appendChild(script);
+    }
+  }
+
+  const submit = el("button", { className: "anda-primary-btn", type: "submit", text: ctx.viewer.text(hs.submitLabel) || ctx.t("submit") });
+  const status = el("p", { role: "status", style: "margin-top:10px;font-size:14px;" });
+  form.append(submit, status);
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    // Validacion basica
+    for (const f of fields) {
+      const value = f.input instanceof HTMLInputElement && f.input.type === "checkbox" ? f.input.checked : f.input.value;
+      form.querySelector(`#u3f-${f.id} + .anda-form__error`)?.remove();
+      if (f.required && (value === "" || value === false)) {
+        f.input.insertAdjacentElement("afterend", el("p", { className: "anda-form__error", text: ctx.t("required_field") }));
+        return;
+      }
+      if (f.input instanceof HTMLInputElement && f.input.type === "email" && f.input.value !== "" && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(f.input.value)) {
+        f.input.insertAdjacentElement("afterend", el("p", { className: "anda-form__error", text: ctx.t("invalid_email") }));
+        return;
+      }
+    }
+    const data: Record<string, unknown> = {};
+    for (const f of fields) {
+      data[f.id] = f.input instanceof HTMLInputElement && f.input.type === "checkbox" ? f.input.checked : f.input.value;
+    }
+    submit.disabled = true;
+    status.textContent = ctx.t("sending");
+    const destination = ctx.formEndpoint != null && hs.destination.api !== false ? ctx.formEndpoint : hs.destination.webhook;
+    const send = async (): Promise<"sent" | "already"> => {
+      if (destination == null) throw new Error("sin destino");
+      const res = await fetch(destination, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          hotspotId: hs.id,
+          lang: ctx.viewer.currentLang(),
+          data,
+          turnstileToken,
+          visitorId: visitorId(),
+        }),
+      });
+      // 409: el servidor ya tiene el envío de este visitante
+      if (res.status === 409) return "already";
+      if (!res.ok) throw new Error(String(res.status));
+      return "sent";
+    };
+    send()
+      .then((resultado: "sent" | "already") => {
+        if (resultado === "sent") ctx.viewer.trackForm(hs.id);
+        if (hs.once === true) rememberFormSent(hs.id);
+        ctx.viewer.markFormSubmitted(hs.id);
+        const texto =
+          resultado === "already" ? ctx.t("form_already_sent") : ctx.viewer.text(hs.successMessage) || ctx.t("form_success");
+        form.replaceChildren(el("p", { className: "anda-prose", text: texto }));
+      })
+      .catch(() => {
+        submit.disabled = false;
+        status.textContent = ctx.t("form_error");
+      });
+  });
+
+  body.appendChild(form);
+  return { body };
+}
+
+function comparePanel(hs: CompareHotspot, ctx: PanelContext): PanelContent {
+  if (hs.mode === "panoramas") {
+    return comparePanoramas(hs, ctx);
+  }
+  const body = el("div", { className: "anda-panel__body anda-panel__body--flush" });
+  const wrap = el("div", { className: "anda-compare" });
+  const before = el("img", { src: resolveUrl(ctx.baseUrl, hs.before.url ?? ""), alt: ctx.viewer.text(hs.before.label) || ctx.t("before") });
+  const afterClip = el("div", { className: "anda-compare__after" });
+  const after = el("img", { src: resolveUrl(ctx.baseUrl, hs.after.url ?? ""), alt: ctx.viewer.text(hs.after.label) || ctx.t("after") });
+  afterClip.appendChild(after);
+  const handle = el("div", { className: "anda-compare__handle", role: "slider", "aria-label": "Comparador", tabindex: "0", "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": "50" });
+  const tagB = el("span", { className: "anda-compare__tag", text: ctx.viewer.text(hs.before.label) || ctx.t("before"), style: "left:10px;" });
+  const tagA = el("span", { className: "anda-compare__tag", text: ctx.viewer.text(hs.after.label) || ctx.t("after"), style: "right:10px;" });
+  wrap.append(before, afterClip, handle, tagB, tagA);
+  body.appendChild(wrap);
+  const setPos = (pct: number): void => {
+    const p = Math.max(0, Math.min(100, pct));
+    afterClip.style.clipPath = `inset(0 0 0 ${p}%)`;
+    handle.style.left = `calc(${p}% - 2px)`;
+    handle.setAttribute("aria-valuenow", String(Math.round(p)));
+  };
+  setPos(50);
+  let dragging = false;
+  const fromEvent = (clientX: number): number => {
+    const rect = wrap.getBoundingClientRect();
+    return ((clientX - rect.left) / rect.width) * 100;
+  };
+  wrap.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    wrap.setPointerCapture(e.pointerId);
+    setPos(fromEvent(e.clientX));
+  });
+  wrap.addEventListener("pointermove", (e) => {
+    if (dragging) setPos(fromEvent(e.clientX));
+  });
+  wrap.addEventListener("pointerup", () => {
+    dragging = false;
+  });
+  handle.addEventListener("keydown", (e) => {
+    const now = Number(handle.getAttribute("aria-valuenow"));
+    if (e.key === "ArrowLeft") setPos(now - 4);
+    if (e.key === "ArrowRight") setPos(now + 4);
+  });
+  return { body, wide: true };
+}
+
+/**
+ * Comparador de dos escenas: vista dividida con dos motores sincronizados
+ * dentro del propio panel. Arrastrar en uno mueve el otro.
+ *
+ * Antes eran dos iframes de la página publicada entera —con su barra, sus
+ * miniaturas y su pantalla de bienvenida cada uno—, que además no existían
+ * en la vista previa del editor. Ahora son dos lienzos limpios del mismo tour
+ * (sin hotspots ni cromo), que funcionan igual publicados, exportados y en
+ * el Studio.
+ */
+function comparePanoramas(hs: CompareHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body anda-panel__body--flush" });
+  const beforeLabel = ctx.viewer.text(hs.before.label) || ctx.t("before");
+  const afterLabel = ctx.viewer.text(hs.after.label) || ctx.t("after");
+  const split = el("div", { className: "anda-split" });
+  const v = ctx.viewer.view();
+  const tour = ctx.viewer.tour;
+  const visores: TourViewer[] = [];
+  const mkPane = (sceneId: string | undefined, label: string): HTMLElement => {
+    const pane = el("div", { className: "anda-split__pane" });
+    if (sceneId == null || !tour.scenes.some((s) => s.id === sceneId)) return pane;
+    const lienzo = el("div", { className: "anda-split__viewer" });
+    pane.append(lienzo, el("span", { className: "anda-compare__tag", text: label, style: "left:10px;top:10px;bottom:auto;" }));
+    // Un tour recortado: solo las escenas, sin marcadores que se pisen con el
+    // arrastre, y arrancando en la escena que toca con la vista actual
+    const recorte = {
+      ...tour,
+      scenes: tour.scenes.map((s) => ({ ...s, hotspots: [] })),
+      start: { scene: sceneId, view: { yaw: v.yaw, pitch: v.pitch, fov: v.fov }, intro: "none" as const },
+      autorotate: undefined,
+      autopilot: undefined,
+      ui: { ...tour.ui, welcome: undefined },
+    };
+    visores.push(
+      new TourViewer({
+        container: lienzo,
+        tour: recorte,
+        baseUrl: ctx.baseUrl,
+        lang: ctx.viewer.currentLang(),
+        deepLinks: false,
+        analyticsEndpoint: null,
+        editMode: true,
+      }),
+    );
+    return pane;
+  };
+  split.append(mkPane(hs.before.sceneId, beforeLabel), mkPane(hs.after.sceneId, afterLabel));
+  body.appendChild(split);
+
+  // Sincronía bidireccional con supresión de eco
+  let empujando = false;
+  for (const origen of visores) {
+    origen.on("viewChange", (vista) => {
+      if (empujando) return;
+      empujando = true;
+      for (const otro of visores) if (otro !== origen) otro.setView(vista);
+      empujando = false;
+    });
+  }
+  const observer = new MutationObserver(() => {
+    if (!document.contains(split)) {
+      for (const vw of visores) vw.destroy();
+      observer.disconnect();
+    }
+  });
+  observer.observe(ctx.container, { childList: true, subtree: true });
+  return {
+    body,
+    wide: true,
+    // Los motores se crean antes de que el panel esté en el documento, con
+    // los lienzos a 0×0: en cuanto se monta, que midan de verdad
+    onMounted: () => {
+      for (const vw of visores) vw.marzipanoViewer().updateSize?.();
+    },
+  };
+}
+
+function quizPanel(hs: QuizHotspot, ctx: PanelContext): PanelContent {
+  const body = el("div", { className: "anda-panel__body" });
+  const preguntas = quizQuestions(hs);
+  if (preguntas.length <= 1) {
+    // Una sola pregunta: el panel de siempre, sin paginación
+    const unica = preguntas[0];
+    if (unica != null) body.appendChild(quizQuestionView(hs, unica, `quiz-${hs.id}`, ctx, () => {}));
+    return { body };
+  }
+
+  // Varias preguntas: una por página, con anterior/siguiente y un resumen al
+  // final («Has acertado 4 de 5»). Cada página conserva su estado al volver.
+  const progress = el("p", { className: "anda-quiz__progress", "aria-live": "polite" });
+  const pages = preguntas.map((q) =>
+    quizQuestionView(hs, q, `quiz-${hs.id}-${q.id}`, ctx, () => {
+      renderNav();
+    }),
+  );
+  const summary = el("div", { className: "anda-quiz__summary", role: "status" });
+  const prev = el("button", { className: "anda-primary-btn anda-quiz__nav-btn", type: "button", text: ctx.t("quiz_prev") });
+  const next = el("button", { className: "anda-primary-btn anda-quiz__nav-btn", type: "button", text: ctx.t("quiz_next") });
+  const nav = el("div", { className: "anda-quiz__nav" }, prev, next);
+  body.append(progress, ...pages, summary, nav);
+
+  // Si ya se respondieron todas (panel reabierto), se empieza por el resumen
+  const terminada = (i: number): boolean => ctx.viewer.quizAnswer(hs.id, preguntas[i]!.id) != null;
+  let index = preguntas.every((_, i) => terminada(i)) ? preguntas.length : 0;
+
+  function renderSummary(): void {
+    const aciertos = preguntas.filter((q) => ctx.viewer.quizAnswer(hs.id, q.id)?.correct === true).length;
+    summary.replaceChildren(
+      el("p", { className: "anda-quiz__summary-score", text: ctx.t("quiz_summary", { correct: aciertos, total: preguntas.length }) }),
+    );
+    if (hs.gate === true && !ctx.viewer.quizGateOpen(hs.id)) {
+      summary.append(el("p", { text: ctx.t("quiz_gate_message"), style: "margin:6px 0 0;font-size:13px;" }));
+    }
+  }
+
+  function renderNav(): void {
+    const enResumen = index >= preguntas.length;
+    pages.forEach((p, i) => {
+      p.hidden = i !== index;
+    });
+    summary.hidden = !enResumen;
+    if (enResumen) renderSummary();
+    progress.textContent = enResumen ? ctx.t("quiz_summary_title") : ctx.t("quiz_question_of", { n: index + 1, total: preguntas.length });
+    prev.disabled = index === 0;
+    prev.textContent = enResumen ? ctx.t("quiz_review") : ctx.t("quiz_prev");
+    // En la última, «Siguiente» lleva al resumen cuando ya están todas
+    const todas = preguntas.every((_, i) => terminada(i));
+    next.hidden = enResumen;
+    next.disabled = index === preguntas.length - 1 && !todas;
+    next.textContent = index === preguntas.length - 1 ? ctx.t("quiz_see_result") : ctx.t("quiz_next");
+  }
+
+  prev.addEventListener("click", () => {
+    index = index >= preguntas.length ? 0 : Math.max(0, index - 1);
+    renderNav();
+  });
+  next.addEventListener("click", () => {
+    index = Math.min(preguntas.length, index + 1);
+    renderNav();
+  });
+  renderNav();
+  return { body };
+}
+
+/**
+ * Una pregunta: enunciado, opciones, comprobar y feedback. `onFinished` se
+ * llama cuando la pregunta queda terminada (acertada o sin intentos).
+ */
+function quizQuestionView(
+  hs: QuizHotspot,
+  q: QuizQuestion,
+  name: string,
+  ctx: PanelContext,
+  onFinished: () => void,
+): HTMLElement {
+  const page = el("div", { className: "anda-quiz__question" });
+  const question = el("div", { className: "anda-prose" });
+  question.innerHTML = renderMarkdown(ctx.viewer.text(q.question));
+  page.appendChild(question);
+
+  const multi = q.kind === "multiple";
+  const optEls: { id: string; input: HTMLInputElement; wrap: HTMLElement; correct: boolean }[] = [];
+  const list = el("div", { role: multi ? "group" : "radiogroup", "aria-label": ctx.viewer.text(q.question) });
+  for (const opt of q.options) {
+    const input = el("input", { type: multi ? "checkbox" : "radio", name, id: `${name}-${opt.id}` });
+    const wrap = el(
+      "label",
+      { className: "anda-quiz__option", for: `${name}-${opt.id}` },
+      input,
+      el("span", { text: ctx.viewer.text(opt.text) }),
+    );
+    list.appendChild(wrap);
+    optEls.push({ id: opt.id, input, wrap, correct: opt.correct === true });
+  }
+  page.appendChild(list);
+
+  let attempts = 0;
+  const maxAttempts = hs.attempts ?? 0;
+  const check = el("button", { className: "anda-primary-btn", type: "button", text: ctx.t("quiz_check") });
+  const feedback = el("div", { role: "status" });
+  page.append(check, feedback);
+
+  check.addEventListener("click", () => {
+    const selected = optEls.filter((o) => o.input.checked).map((o) => o.id);
+    if (selected.length === 0) return;
+    attempts++;
+    const isCorrect = isQuizAnswerCorrect(q, selected);
+    for (const o of optEls) {
+      if (o.input.checked) o.wrap.dataset.state = o.correct ? "correct" : "wrong";
+      else if (isCorrect && o.correct) o.wrap.dataset.state = "correct";
+      else delete o.wrap.dataset.state;
+      o.input.disabled = isCorrect || (maxAttempts > 0 && attempts >= maxAttempts);
+    }
+    feedback.className = `anda-quiz__feedback ${isCorrect ? "anda-quiz__feedback--ok" : "anda-quiz__feedback--ko"}`;
+    feedback.textContent = isCorrect
+      ? ctx.viewer.text(q.feedbackCorrect) || ctx.t("quiz_correct")
+      : ctx.viewer.text(q.feedbackWrong) || ctx.t("quiz_incorrect");
+    const finished = isCorrect || (maxAttempts > 0 && attempts >= maxAttempts);
+    if (finished) {
+      check.disabled = true;
+      // El visor recalcula la compuerta con todas las preguntas de la escena:
+      // acertar esta no abre la salida si otra con compuerta sigue mal.
+      ctx.viewer.reportQuizAnswer(hs.id, isCorrect, quizQuestionPoints(q), selected, q.id);
+      onFinished();
+    }
+    // El aviso es el de la pregunta, no el de la narración. Solo mientras
+    // quedan intentos: agotados, la pregunta queda terminada (cuenta como
+    // fallo) y deja de retener cuando lo están todas las del marcador.
+    if (hs.gate === true && !isCorrect && !finished) {
+      feedback.append(el("p", { text: ctx.t("quiz_gate_message"), style: "margin:6px 0 0;font-size:13px;" }));
+    }
+  });
+  return page;
+}

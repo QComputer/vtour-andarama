@@ -1,0 +1,1078 @@
+import { langDir, langNativeName, type Tour } from "@andarama/schema";
+import { createIconSvg, resolveUrl, TourViewer, type QuizStateEvent } from "@andarama/viewer";
+import { injectStyles } from "./styles.js";
+import { createTranslator, ensureUiLang, type Translator } from "./i18n.js";
+import { registerUiIcons } from "./icons.js";
+import { el, iconButton, mountScreen, toast } from "./dom.js";
+import { openPdfForVr, PanelHost } from "./panels.js";
+import { badgeLabel } from "./badge.js";
+import {
+  buildCompass,
+  buildMapPanel,
+  buildSceneMenu,
+  buildThumbnails,
+  buildWelcomeScreen,
+  showFinalScreen,
+  showHelp,
+  showShareDialog,
+  type MapPanel,
+} from "./components.js";
+import { shouldOpenFloorplanAtStart } from "./floorplan.js";
+import { startGaze, type GazeHandle } from "./gaze.js";
+import { buildAccessibleView } from "./accessible.js";
+import { downloadCertificate } from "./certificate.js";
+import { LiveClient, type LiveOptions } from "./live.js";
+import { wasFormSent } from "./visitor.js";
+import { allowedProjections } from "./projections.js";
+import { buildQuizPayload, quizComplete, quizSignature, sendQuizResult } from "./quiz-result.js";
+
+export interface SkinOptions {
+  container: HTMLElement;
+  tour: Tour;
+  baseUrl?: string;
+  lang?: string;
+  analyticsEndpoint?: string | null;
+  formEndpoint?: string | null;
+  /** Endpoint del resultado del quiz (null en un paquete exportado sin servidor). */
+  quizEndpoint?: string | null;
+  /** Lanzamiento LTI (`?lti=`): la nota vuelve al libro de calificaciones. */
+  ltiLaunchId?: string | null;
+  /** Nombre del participante (del LMS o de `?name=`). */
+  participantName?: string | null;
+  turnstileSiteKey?: string | null;
+  editMode?: boolean;
+  deepLinks?: boolean;
+  /** Modo kiosko: autopilot + reinicio por inactividad. */
+  kiosk?: boolean | { inactivitySeconds?: number };
+  /** Sala en vivo a la que conectarse automaticamente. */
+  live?: LiveOptions;
+  /**
+   * Insignia «Hecho con Andarama»: enlace discreto que ponen los planes sin
+   * marca blanca de la instancia alojada. El self-host nunca la manda.
+   */
+  badge?: { url: string };
+}
+
+export interface MountedSkin {
+  viewer: TourViewer;
+  panelHost: PanelHost;
+  live: LiveClient | null;
+  destroy: () => void;
+}
+
+/**
+ * Monta el visor completo (motor + skin). Es la unica funcion que necesitan
+ * los tours publicados, los paquetes exportados y la vista previa del
+ * Studio (esta ultima con editMode).
+ */
+export function mountViewer(options: SkinOptions): MountedSkin {
+  registerUiIcons();
+  const tour = options.tour;
+  const theme = tour.ui?.theme;
+  injectStyles(theme?.customCss);
+
+  const container = options.container;
+  // Las variables CSS del tema viven en .anda-viewer: debe estar tambien
+  // en el contenedor exterior, donde cuelga el cromo de la skin.
+  container.classList.add("anda-viewer");
+  if (getComputedStyle(container).position === "static") container.style.position = "relative";
+  container.dataset.theme = theme?.base ?? "anda";
+  if (theme?.primaryColor != null) container.style.setProperty("--u3-primary", theme.primaryColor);
+  if (theme?.fontFamily != null) container.style.setProperty("--u3-font", theme.fontFamily);
+  if (theme?.borderRadius != null) container.style.setProperty("--u3-radius", theme.borderRadius);
+
+  // Trabajos de limpieza que hay que deshacer al desmontar
+  const cleanups: (() => void)[] = [];
+
+  const stage = el("div", { style: "position:absolute;inset:0;" });
+  container.appendChild(stage);
+
+  const viewer = new TourViewer({
+    container: stage,
+    tour,
+    lang: options.lang,
+    baseUrl: options.baseUrl,
+    editMode: options.editMode,
+    deepLinks: options.deepLinks,
+    analyticsEndpoint: options.analyticsEndpoint,
+    // Los textos del modo inmersivo (paneles VR) siguen el idioma del tour
+    translate: (key, params) => t(key as never, params),
+    // Los PDF se leen también dentro de las gafas, con el mismo pdf.js
+    loadPdf: (url) => openPdfForVr(url),
+  });
+
+  const t0 = createTranslator(viewer.currentLang());
+  let t: Translator = t0;
+  // Idioma y dirección de escritura del cromo: lectores de pantalla, la
+  // tipografía por alfabeto y el árabe y el hebreo de derecha a izquierda.
+  const aplicarIdioma = (lang: string): void => {
+    container.lang = lang;
+    container.dir = langDir(lang);
+  };
+  aplicarIdioma(viewer.currentLang());
+  // Si quien monta no pasó antes por ensureUiLang, el diccionario del idioma
+  // del tour se pide ahora; los textos lo usan en su siguiente pintado.
+  void ensureUiLang(viewer.currentLang()).then(() => {
+    t = createTranslator(viewer.currentLang());
+  });
+  const baseUrl = options.baseUrl ?? "";
+  const edit = options.editMode === true;
+  // Modo edicion: el editor solo necesita el lienzo, la brujula y el zoom.
+  // El resto del cromo (menus, miniaturas, compartir, VR, pantalla completa,
+  // postMessage...) pertenece al tour publicado y en el editor estorba o se
+  // solapa con la interfaz propia del Studio.
+  const ui: NonNullable<typeof tour.ui> = edit
+    ? {
+        titleBar: false,
+        sceneMenu: false,
+        thumbnails: false,
+        compass: true,
+        loadingIndicator: true,
+        zoomControls: true,
+        gyroToggle: false,
+        vr: false,
+        fullscreen: false,
+        share: false,
+        mute: false,
+        langSelector: false,
+        help: false,
+        accessibleMode: false,
+      }
+    : (tour.ui ?? {});
+
+  const panelHost = new PanelHost({
+    viewer,
+    t,
+    baseUrl,
+    container,
+    formEndpoint: options.formEndpoint ?? null,
+    turnstileSiteKey: options.turnstileSiteKey ?? null,
+  });
+  viewer.on("hotspotActivate", (e) => panelHost.open(e.hotspot, e.element));
+  // Formularios de un solo envío ya enviados en otra visita: cuentan como
+  // enviados desde el principio (su compuerta, si la tienen, está abierta)
+  if (!edit) {
+    for (const scene of tour.scenes) {
+      for (const h of scene.hotspots) {
+        if (h.type === "form" && h.once === true && wasFormSent(h.id)) viewer.markFormSubmitted(h.id);
+      }
+    }
+  }
+  viewer.on("hotspotDeactivate", () => panelHost.close());
+
+  // Skip link accesible
+  const skip = el("a", { className: "anda-skiplink", href: "#", text: t("accessible_mode") });
+  container.appendChild(skip);
+
+  // ------- Barra superior flotante -------
+  const topbar = el("div", { className: "anda-topbar" });
+  const topPill = el("div", { className: "anda-topbar__pill" });
+  if (ui.sceneMenu !== false) {
+    const menu = buildSceneMenu(viewer, t, baseUrl);
+    container.appendChild(menu.root);
+    const menuBtn = iconButton("menu", t("menu"), menu.toggle);
+    // El botón dice si el menú de escenas está abierto
+    menuBtn.setAttribute("aria-expanded", "false");
+    new MutationObserver(() => menuBtn.setAttribute("aria-expanded", menu.root.dataset.open ?? "false")).observe(menu.root, {
+      attributes: true,
+      attributeFilter: ["data-open"],
+    });
+    topPill.appendChild(menuBtn);
+  }
+  if (ui.titleBar !== false) {
+    topPill.appendChild(el("h1", { className: "anda-title", text: viewer.text(tour.meta.title) }));
+  }
+  if (topPill.childElementCount > 0) topbar.appendChild(topPill);
+  if (ui.logo != null) {
+    const img = el("img", { src: resolveUrl(baseUrl, ui.logo.image), alt: "" });
+    const logo =
+      ui.logo.link != null
+        ? el("a", { className: "anda-logo", href: ui.logo.link, target: "_blank", rel: "noopener" }, img)
+        : el("div", { className: "anda-logo" }, img);
+    topbar.appendChild(logo);
+  }
+  if (topbar.childElementCount > 0) container.appendChild(topbar);
+
+  if (ui.watermark != null) {
+    const img = el("img", { src: resolveUrl(baseUrl, ui.watermark.image), alt: "" });
+    const wm =
+      ui.watermark.link != null
+        ? el("a", { className: "anda-watermark", href: ui.watermark.link, target: "_blank", rel: "noopener" }, img)
+        : el("div", { className: "anda-watermark" }, img);
+    container.appendChild(wm);
+  }
+
+  // Insignia «Hecho con Andarama» (planes sin marca blanca de la instancia
+  // alojada): un enlace pequeño sobre los controles, que no tapa el panorama
+  // y sigue el tema. En pantalla completa va dentro del contenedor, así que
+  // también se ve.
+  if (options.badge != null && !options.editMode) {
+    // El texto lo puede cambiar el autor (ui.badgeText); el enlace no
+    const texto = badgeLabel(tour.ui?.badgeText, t("made_with_andarama"));
+    const badge = el(
+      "a",
+      { className: "anda-badge", href: options.badge.url, target: "_blank", rel: "noopener", "aria-label": texto },
+      texto,
+    );
+    container.appendChild(badge);
+  }
+
+  // Parche de nadir con logo (oculta el tripode): hotspot fijo en el nadir.
+  if (ui.nadirPatch != null) {
+    viewer.on("ready", () => {
+      const marz = viewer.marzipanoViewer();
+      const scene = marz.scene();
+      if (scene != null) {
+        const img = el("img", {
+          src: resolveUrl(baseUrl, ui.nadirPatch!.image),
+          alt: "",
+          style: `width:${ui.nadirPatch!.size ?? 220}px;border-radius:50%;`,
+        });
+        try {
+          scene.hotspotContainer().createHotspot(img, { yaw: 0, pitch: -Math.PI / 2 + 0.001 });
+        } catch {
+          // sin soporte de hotspots en esta escena
+        }
+      }
+    });
+  }
+
+  // ------- Brujula -------
+  if (ui.compass !== false) container.appendChild(buildCompass(viewer, t));
+
+  // ------- Miniaturas -------
+  // Las miniaturas las decide el tour, pero también quien mira: en un móvil
+  // ocupan un tercio de la pantalla y a veces se quieren fuera.
+  const THUMBS_KEY = "andarama.thumbs";
+  let thumbsEl: HTMLElement | null = null;
+  const thumbsAllowed = ui.thumbnails !== false;
+  let thumbsOn = thumbsAllowed && localStorage.getItem(THUMBS_KEY) !== "off";
+  const renderThumbs = (): void => {
+    if (thumbsOn && thumbsEl == null) {
+      thumbsEl = buildThumbnails(viewer, t, baseUrl);
+      container.appendChild(thumbsEl);
+    } else if (!thumbsOn && thumbsEl != null) {
+      thumbsEl.remove();
+      thumbsEl = null;
+    }
+  };
+  renderThumbs();
+
+  // ------- Plano / mapa -------
+  const mapPanel: MapPanel = edit
+    ? { root: el("div"), toggle: () => {}, setOpen: () => {}, isOpen: () => false, onChange: () => {}, setFocusReturn: () => {}, available: false }
+    : buildMapPanel(viewer, t, baseUrl);
+  if (mapPanel.available) container.appendChild(mapPanel.root);
+
+  // ------- Indicador de carga -------
+  if (ui.loadingIndicator !== false) {
+    const loading = el("div", { className: "anda-loading", role: "status", "aria-label": t("loading") },
+      el("div", { className: "anda-loading__spinner" }));
+    container.appendChild(loading);
+    viewer.on("ready", () => loading.remove());
+    setTimeout(() => loading.remove(), 15000);
+  }
+
+  // ------- Controles laterales -------
+  const controls = el("div", { className: "anda-controls" });
+  // Dique plegable: en un móvil, ocho botones se comen la escena. Se recuerda
+  // la decisión, y en pantallas pequeñas empieza plegado.
+  const COMPACT_KEY = "andarama.compactControls";
+  const saved = localStorage.getItem(COMPACT_KEY);
+  let compact = saved != null ? saved === "on" : window.matchMedia("(max-width: 640px)").matches;
+  const applyCompact = (): void => {
+    controls.classList.toggle("is-compact", compact);
+    compactBtn.setAttribute("aria-expanded", String(!compact));
+    compactBtn.setAttribute("aria-label", compact ? t("expand_controls") : t("compact_controls"));
+    compactBtn.replaceChildren(createIconSvg(compact ? "chevrons-up" : "chevrons-down", 20));
+  };
+  const compactBtn = iconButton("chevrons-down", t("compact_controls"), () => {
+    compact = !compact;
+    localStorage.setItem(COMPACT_KEY, compact ? "on" : "off");
+    applyCompact();
+  });
+  compactBtn.classList.add("anda-controls__toggle");
+  const controlsLeft = el("div", { className: "anda-controls-left" });
+
+  if (mapPanel.available) {
+    // Botón de mostrar/ocultar: un clic con el ratón no mueve el foco; con
+    // Enter o Espacio (clic sin puntero, detail 0) lo lleva al punto actual
+    const mapBtn = iconButton("map", t("map"), () => {});
+    mapBtn.addEventListener("click", (e) => mapPanel.toggle({ focus: e.detail === 0 }));
+    mapBtn.title = t("map_toggle_hint");
+    mapBtn.setAttribute("aria-controls", mapPanel.root.id);
+    mapBtn.setAttribute("aria-expanded", "false");
+    mapBtn.setAttribute("aria-keyshortcuts", "M");
+    mapPanel.onChange((open) => mapBtn.setAttribute("aria-expanded", String(open)));
+    mapPanel.setFocusReturn(mapBtn);
+    controlsLeft.appendChild(mapBtn);
+    // Tecla M: mostrar u ocultar el plano desde cualquier sitio del visor,
+    // salvo mientras se escribe o con un diálogo encima
+    const onMapKey = (e: KeyboardEvent): void => {
+      if (e.key !== "m" && e.key !== "M") return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, [contenteditable=''], [contenteditable='true']") != null) return;
+      if (container.querySelector(".anda-screen, .anda-panel-backdrop") != null) return;
+      // Fuera del visor solo cuenta el <body>, y solo si el visor ocupa la
+      // página (el recorrido publicado): incrustado entre otros contenidos,
+      // la M es de la página hasta que se entra en el visor
+      const ocupaLaPagina = container.clientWidth >= window.innerWidth * 0.9 && container.clientHeight >= window.innerHeight * 0.9;
+      if (target != null && !container.contains(target) && !(target === document.body && ocupaLaPagina)) return;
+      e.preventDefault();
+      mapPanel.toggle({ focus: true });
+    };
+    document.addEventListener("keydown", onMapKey);
+    cleanups.push(() => document.removeEventListener("keydown", onMapKey));
+    // El panel sale justo encima del dique izquierdo, que crece con el botón
+    // de volver y el de la visita automática: con una altura fija lo tapaba
+    // y el botón del mapa quedaba debajo del propio plano
+    const syncDock = (): void => {
+      container.style.setProperty("--anda-dock-left-h", `${controlsLeft.offsetHeight}px`);
+    };
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(syncDock);
+      ro.observe(controlsLeft);
+      cleanups.push(() => ro.disconnect());
+    }
+    requestAnimationFrame(syncDock);
+    // Minimapa abierto desde el principio si el autor lo pide (no en el editor)
+    if (!edit && shouldOpenFloorplanAtStart(tour, container.clientWidth || window.innerWidth)) mapPanel.setOpen(true);
+  }
+  // Volver a la escena anterior (se puede quitar en los ajustes del tour)
+  if (!edit && ui.backButton !== false) {
+    const backBtn = iconButton("arrow-left", t("previous_scene"), () => void viewer.back());
+    backBtn.disabled = true;
+    viewer.on("sceneChange", () => {
+      backBtn.disabled = !viewer.canGoBack();
+    });
+    controlsLeft.appendChild(backBtn);
+  }
+
+  // Autopilot. El botón se puede quitar desde los ajustes del tour (hay
+  // recorridos que solo quieren verse en el quiosco).
+  const enQuiosco = options.kiosk != null && options.kiosk !== false;
+  if ((tour.autopilot?.length ?? 0) > 0 && options.editMode !== true && ui.autopilotButton !== false && !enQuiosco) {
+    const apBtn = iconButton("play", t("autoplay_tour"), () => {
+      if (viewer.autopilotActive()) viewer.stopAutopilot();
+      else viewer.startAutopilot();
+    });
+    viewer.on("autopilotChange", (e) => {
+      apBtn.setAttribute("aria-pressed", String(e.active));
+      apBtn.replaceChildren(createIconSvg(e.active ? "pause" : "play", 20));
+      apBtn.setAttribute("aria-label", e.active ? t("stop_autoplay") : t("autoplay_tour"));
+      // Una visita que termina sola devuelve al visitante al principio, que
+      // es donde tiene sentido volver a mirar por su cuenta
+      if (!e.active && e.reason === "finished") {
+        toast(container, t("autoplay_finished"));
+        void viewer.goTo(tour.start.scene, { view: tour.start.view, force: true, skipHistory: true });
+      }
+    });
+    controlsLeft.appendChild(apBtn);
+  }
+
+  if (ui.zoomControls !== false) {
+    controls.appendChild(
+      iconButton("plus", t("zoom_in"), () => viewer.lookTo({ fov: Math.max(0.35, viewer.view().fov * 0.75) }, 300)),
+    );
+    controls.appendChild(
+      iconButton("minus", t("zoom_out"), () => viewer.lookTo({ fov: Math.min(2.4, viewer.view().fov * 1.33) }, 300)),
+    );
+  }
+
+  if (ui.gyroToggle !== false && "DeviceOrientationEvent" in window && /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)) {
+    // Con el giroscopio la pantalla se mira, no se toca: aparece el retículo
+    // central y sostener la mirada sobre un marcador lo acciona.
+    let gaze: GazeHandle | null = null;
+    const stopGaze = (): void => {
+      gaze?.stop();
+      gaze = null;
+    };
+    const startGazeReticle = (): void => {
+      stopGaze();
+      gaze = startGaze(container, {
+        seconds: tour.vr?.dwellSeconds ?? 1.5,
+        getView: () => {
+          const v = viewer.view();
+          return { yaw: v.yaw, pitch: v.pitch };
+        },
+      });
+    };
+    const gyroBtn = iconButton("smartphone", t("gyro"), () => {
+      if (viewer.gyroActive()) {
+        viewer.disableGyro();
+        stopGaze();
+        gyroBtn.setAttribute("aria-pressed", "false");
+      } else {
+        void viewer.enableGyro().then((ok) => {
+          gyroBtn.setAttribute("aria-pressed", String(ok));
+          if (ok) {
+            startGazeReticle();
+            toast(container, t("gaze_hint"));
+          }
+        });
+      }
+    });
+    controls.appendChild(gyroBtn);
+    cleanups.push(stopGaze);
+    // El modo VR dibuja su propio retículo: el plano, si seguía puesto por el
+    // giroscopio, quedaba flotando entre los dos ojos.
+    viewer.on("vrChange", (e) => {
+      if (e.active) stopGaze();
+      else if (viewer.gyroActive()) startGazeReticle();
+    });
+  }
+
+  if (ui.vr !== false) {
+    const vrBtn = iconButton("glasses", t("vr_mode"), () => {
+      // WebXR solo existe en contextos seguros: sin HTTPS el visor entra en
+      // modo cardboard, así que conviene avisar de por qué no hay inmersión.
+      if (!isSecureContext && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) {
+        toast(container, t("vr_needs_https"));
+      }
+      // El permiso de movimiento de iOS se pide **aquí**, dentro del gesto del
+      // usuario: si se espera a montar el modo cartón, Safari ya lo ha
+      // consumido y rechaza la pregunta sin decir nada.
+      void viewer.requestMotionPermission().then(() => viewer.enterVr());
+    });
+    viewer.on("vrChange", (e) => {
+      vrBtn.setAttribute("aria-pressed", String(e.active));
+      if (e.active && e.mode === "xr") toast(container, t("vr_hint_hands"));
+    });
+    controls.appendChild(vrBtn);
+  }
+
+  if (thumbsAllowed) {
+    const thumbsBtn = iconButton("layout-grid", t("toggle_thumbnails"), () => {
+      thumbsOn = !thumbsOn;
+      localStorage.setItem(THUMBS_KEY, thumbsOn ? "on" : "off");
+      thumbsBtn.setAttribute("aria-pressed", String(thumbsOn));
+      renderThumbs();
+    });
+    thumbsBtn.setAttribute("aria-pressed", String(thumbsOn));
+    controls.appendChild(thumbsBtn);
+  }
+
+  if (ui.fullscreen !== false && document.fullscreenEnabled) {
+    const fsBtn = iconButton("maximize", t("fullscreen"), () => {
+      if (document.fullscreenElement != null) void document.exitFullscreen();
+      else void container.requestFullscreen();
+    });
+    document.addEventListener("fullscreenchange", () => {
+      const active = document.fullscreenElement != null;
+      fsBtn.replaceChildren(createIconSvg(active ? "minimize" : "maximize", 20));
+      fsBtn.setAttribute("aria-label", active ? t("exit_fullscreen") : t("fullscreen"));
+    });
+    controls.appendChild(fsBtn);
+  }
+
+  if (ui.share !== false) {
+    controls.appendChild(iconButton("share-2", t("share"), () => showShareDialog(viewer, t, container)));
+  }
+
+  if (ui.mute !== false) {
+    const muteBtn = iconButton("volume-2", viewer.audioEngine().muted ? t("unmute") : t("mute"), () => {
+      const next = !viewer.audioEngine().muted;
+      viewer.audioEngine().setMuted(next);
+      muteBtn.replaceChildren(createIconSvg(next ? "volume-x" : "volume-2", 20));
+      muteBtn.setAttribute("aria-label", next ? t("unmute") : t("mute"));
+      muteBtn.setAttribute("aria-pressed", String(next));
+    });
+    if (viewer.audioEngine().muted) muteBtn.replaceChildren(createIconSvg("volume-x", 20));
+    controls.appendChild(muteBtn);
+  }
+
+  // Selector de idioma
+  if (ui.langSelector !== false && tour.meta.langs.length > 1) {
+    const langBtn = iconButton("languages", t("language"), () => {
+      const existing = container.querySelector(".anda-menu-pop");
+      if (existing != null) {
+        existing.remove();
+        return;
+      }
+      const pop = el("div", { className: "anda-menu-pop", role: "menu", style: `bottom:${controls.offsetHeight - (langBtn.offsetTop + 44)}px;` });
+      pop.style.bottom = "auto";
+      pop.style.top = `${langBtn.getBoundingClientRect().top - container.getBoundingClientRect().top}px`;
+      for (const lang of tour.meta.langs) {
+        // Cada idioma con su nombre en su propia lengua («Deutsch», «日本語»)
+        const b = el("button", { type: "button", role: "menuitem", lang, text: langNativeName(lang), "aria-pressed": String(lang === viewer.currentLang()) });
+        b.addEventListener("click", () => {
+          viewer.setLang(lang);
+          pop.remove();
+        });
+        pop.appendChild(b);
+      }
+      container.appendChild(pop);
+    });
+    controls.appendChild(langBtn);
+  }
+
+  // Selector de proyeccion. El autor puede quitarlo o dejar solo algunas;
+  // con una sola no hay nada que elegir y el botón no aparece.
+  const projections = allowedProjections(ui.projections);
+  if (!edit && projections.length > 1) {
+  const projBtn = iconButton("globe", t("projection"), () => {
+    const existing = container.querySelector(".anda-menu-pop");
+    if (existing != null) {
+      existing.remove();
+      return;
+    }
+    const pop = el("div", { className: "anda-menu-pop anda-menu-pop--wide", role: "menu" });
+    pop.style.top = `${projBtn.getBoundingClientRect().top - container.getBoundingClientRect().top}px`;
+    for (const p of projections) {
+      // Cada proyección con una línea que dice qué es: «Panini» o
+      // «arquitectónica» no le dicen nada a quien no viene de la fotografía
+      const b = el(
+        "button",
+        { type: "button", role: "menuitem", "aria-pressed": String(p === viewer.currentProjection()) },
+        el("span", { text: t(`projection_${p}`) }),
+        el("span", { className: "anda-menu-pop__desc", text: t(`projection_${p}_desc` as never) }),
+      );
+      b.addEventListener("click", () => {
+        viewer.setProjection(p);
+        pop.remove();
+      });
+      pop.appendChild(b);
+    }
+    container.appendChild(pop);
+  });
+  controls.appendChild(projBtn);
+  }
+
+  if (ui.help !== false) {
+    controls.appendChild(iconButton("circle-help", t("help"), () => showHelp(t, container, mapPanel.available ? ["help_map_key"] : [])));
+  }
+
+  // Modo accesible
+  let accessibleView: HTMLElement | null = null;
+  const openAccessible = (): void => {
+    if (accessibleView != null) return;
+    accessibleView = buildAccessibleView(viewer, t, baseUrl, () => {
+      accessibleView?.remove();
+      accessibleView = null;
+    });
+    container.appendChild(accessibleView);
+    (accessibleView.querySelector("button") as HTMLElement | null)?.focus();
+  };
+  if (ui.accessibleMode !== false) {
+    controls.appendChild(iconButton("accessibility", t("accessible_mode"), openAccessible));
+    skip.addEventListener("click", (e) => {
+      e.preventDefault();
+      openAccessible();
+    });
+  } else {
+    skip.remove();
+  }
+
+  if (controls.childElementCount > 0) {
+    controls.appendChild(compactBtn);
+    applyCompact();
+    container.appendChild(controls);
+  }
+  if (controlsLeft.childElementCount > 0) container.appendChild(controlsLeft);
+
+  // ------- Video 360: barra de controles -------
+  const videoBar = el("div", { className: "anda-videobar", hidden: true });
+  container.appendChild(videoBar);
+  const refreshVideoBar = (): void => {
+    const video = viewer.videoElement();
+    videoBar.hidden = video == null;
+    if (video == null) {
+      videoBar.replaceChildren();
+      return;
+    }
+    const playBtn = el("button", { type: "button", "aria-label": t("video_play") });
+    playBtn.appendChild(createIconSvg(video.paused ? "play" : "pause", 18));
+    playBtn.addEventListener("click", () => {
+      if (video.paused) void video.play();
+      else video.pause();
+    });
+    video.addEventListener("play", () => playBtn.replaceChildren(createIconSvg("pause", 18)));
+    video.addEventListener("pause", () => playBtn.replaceChildren(createIconSvg("play", 18)));
+    const seek = el("input", { type: "range", min: "0", max: "1000", value: "0", "aria-label": "Seek" });
+    video.addEventListener("timeupdate", () => {
+      if (video.duration > 0) seek.value = String(Math.round((video.currentTime / video.duration) * 1000));
+    });
+    seek.addEventListener("input", () => {
+      if (video.duration > 0) video.currentTime = (Number(seek.value) / 1000) * video.duration;
+    });
+    const muteV = el("button", { type: "button", "aria-label": t("mute") });
+    muteV.appendChild(createIconSvg(video.muted ? "volume-x" : "volume-2", 18));
+    muteV.addEventListener("click", () => {
+      video.muted = !video.muted;
+      muteV.replaceChildren(createIconSvg(video.muted ? "volume-x" : "volume-2", 18));
+    });
+    const speed = el("select", { "aria-label": "Velocidad" });
+    for (const s of [0.5, 0.75, 1, 1.25, 1.5, 2]) {
+      speed.appendChild(el("option", { value: String(s), text: `${s}x`, selected: s === 1 }));
+    }
+    speed.addEventListener("change", () => {
+      video.playbackRate = Number(speed.value);
+    });
+    videoBar.replaceChildren(playBtn, seek, muteV, speed);
+    // Subtitulos WebVTT: activar la pista del idioma actual si existe
+    for (const track of Array.from(video.textTracks)) {
+      track.mode = track.language === viewer.currentLang() ? "showing" : "hidden";
+    }
+  };
+  viewer.on("sceneChange", refreshVideoBar);
+  viewer.on("ready", refreshVideoBar);
+
+  // ------- Busqueda del tesoro -------
+  //
+  // El contador de arriba dice cuántos quedan y ofrece la pista del siguiente
+  // tesoro pendiente de la escena. Al encontrarlos todos lo dice con el
+  // mensaje final del autor (o el de serie), y ahí se queda.
+  let treasureHint: ((hotspotId?: string) => void) | null = null;
+  if (viewer.hasTreasureHunt() && !edit) {
+    const hunt = tour.treasureHunt;
+    const hud = el("div", { className: "anda-toast anda-toast--hud anda-treasure-hud" });
+    const estadoTxt = el("span", { role: "status" });
+    const hintBtn = el("button", { className: "anda-treasure-hud__btn", type: "button", text: t("treasure_hint"), title: t("treasure_show_hint") });
+    const hintTxt = el("p", { className: "anda-treasure-hud__hint", "aria-live": "polite", hidden: true });
+    hud.append(estadoTxt, hintBtn, hintTxt);
+    container.appendChild(hud);
+
+    const pendientesAqui = (): { id: string; hint?: unknown }[] => {
+      const hallados = new Set(viewer.treasureState().foundIds);
+      const escena = tour.scenes.find((s) => s.id === viewer.currentSceneId());
+      return (escena?.hotspots ?? [])
+        .filter((h) => h.type === "treasure" && !hallados.has(h.id))
+        .map((h) => ({ id: h.id, hint: (h as { hint?: unknown }).hint }));
+    };
+    const refresh = (): void => {
+      const { found, total } = viewer.treasureState();
+      if (total > 0 && found >= total) {
+        estadoTxt.textContent = viewer.text(hunt?.completionMessage) || t("treasure_complete_all");
+        hud.classList.add("anda-treasure-hud--done");
+        hintBtn.hidden = true;
+        hintTxt.hidden = true;
+        return;
+      }
+      estadoTxt.textContent = `${viewer.text(hunt?.title) || t("treasure_title")}: ${t("treasure_progress", { found, total })}`;
+      hintBtn.hidden = pendientesAqui().length === 0;
+    };
+    let hintTimer: ReturnType<typeof setTimeout> | null = null;
+    const showHint = (hotspotId?: string): void => {
+      const pendientes = pendientesAqui();
+      const objetivo = pendientes.find((p) => p.id === hotspotId) ?? pendientes[0];
+      const texto =
+        objetivo == null ? t("treasure_none_here") : viewer.text(objetivo.hint as never) || t("treasure_no_hint");
+      hintTxt.textContent = texto;
+      hintTxt.hidden = false;
+      if (hintTimer != null) clearTimeout(hintTimer);
+      hintTimer = setTimeout(() => {
+        hintTxt.hidden = true;
+      }, 12000);
+    };
+    treasureHint = showHint;
+    hintBtn.addEventListener("click", () => {
+      if (!hintTxt.hidden) {
+        hintTxt.hidden = true;
+        return;
+      }
+      showHint();
+    });
+    viewer.on("sceneChange", () => {
+      hintTxt.hidden = true;
+      refresh();
+    });
+    viewer.on("treasureProgress", refresh);
+    refresh();
+    cleanups.push(() => {
+      if (hintTimer != null) clearTimeout(hintTimer);
+    });
+  }
+
+  // ------- Resultado del quiz al servidor (y a la plataforma LTI) -------
+  //
+  // Al terminar todas las preguntas, el resultado se manda al endpoint del
+  // tour publicado (en un paquete exportado no hay endpoint y no se manda).
+  // Si el tour pide el nombre y no llega del LMS, se pide antes de mandar.
+  const quizEndpoint = edit ? null : (options.quizEndpoint ?? null);
+  const quizSession = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  let participantName = options.participantName?.trim() || null;
+  let lastSent: string | null = null;
+  const submitQuizResult = async (state: QuizStateEvent): Promise<boolean> => {
+    if (quizEndpoint == null) return true;
+    const firma = quizSignature(state, participantName);
+    if (firma === lastSent) return true;
+    const ok = await sendQuizResult(
+      quizEndpoint,
+      buildQuizPayload(state, { sessionId: quizSession, participantName, ltiLaunchId: options.ltiLaunchId ?? null }),
+    );
+    if (ok) lastSent = firma;
+    return ok;
+  };
+
+  // ------- Informe de quiz + certificado -------
+  let lastReport: string | null = null;
+  viewer.on("quizChange", (state) => {
+    if (edit || !quizComplete(state)) return;
+    // Volver a abrir una pregunta para abrir su compuerta no cambia la nota:
+    // ni se repite el informe ni se vuelve a mandar el mismo resultado.
+    const firma = quizSignature(state);
+    if (firma === lastReport) return;
+    lastReport = firma;
+    const pideNombre = quizEndpoint != null && tour.quiz?.askName === true && participantName == null;
+    if (!pideNombre) void submitQuizResult(state);
+    const informe = tour.quiz?.finalReport !== false;
+    if (!informe && !pideNombre) return;
+    {
+      panelHost.close();
+      const card = el("div", { className: "anda-screen__card" });
+      card.appendChild(el("h1", { text: t("quiz_report") }));
+      if (informe) {
+        card.appendChild(el("p", { text: `${t("quiz_score")}: ${state.score} / ${state.maxScore}` }));
+        if (state.passed != null) {
+          card.appendChild(el("p", { text: state.passed ? t("quiz_passed") : t("quiz_failed"), style: `color:${state.passed ? "#34d399" : "#f87171"};font-weight:600;` }));
+        }
+      }
+      const inputStyle =
+        "width:100%;padding:10px;border-radius:8px;border:1px solid rgba(128,128,160,.4);background:transparent;color:inherit;margin-top:10px;";
+      if (pideNombre) {
+        const nombre = el("input", { type: "text", placeholder: t("quiz_name_for_result"), "aria-label": t("quiz_name_for_result"), maxlength: "120", style: inputStyle });
+        const enviar = el("button", { className: "anda-primary-btn", type: "button", text: t("quiz_send_result") });
+        const aviso = el("p", { role: "status", style: "margin:8px 0 0;font-size:14px;" });
+        enviar.addEventListener("click", () => {
+          if (nombre.value.trim() === "") {
+            nombre.focus();
+            return;
+          }
+          participantName = nombre.value.trim();
+          enviar.disabled = true;
+          aviso.textContent = t("sending");
+          void submitQuizResult(state).then((ok) => {
+            aviso.textContent = ok ? t("quiz_result_sent") : t("quiz_result_error");
+            enviar.disabled = ok;
+            nombre.disabled = ok;
+          });
+        });
+        card.append(nombre, enviar, aviso);
+      }
+      if (informe && tour.quiz?.certificate?.enabled === true && state.passed !== false) {
+        const nameInput = el("input", {
+          type: "text",
+          placeholder: t("quiz_your_name"),
+          "aria-label": t("quiz_your_name"),
+          value: participantName ?? undefined,
+          style: inputStyle,
+        });
+        const dl = el("button", { className: "anda-primary-btn", type: "button", text: t("quiz_certificate") });
+        dl.addEventListener("click", () => {
+          if (nameInput.value.trim() === "") {
+            nameInput.focus();
+            return;
+          }
+          downloadCertificate({
+            participantName: nameInput.value.trim(),
+            tourTitle: viewer.text(tour.meta.title),
+            certTitle: viewer.text(tour.quiz?.certificate?.title) || t("quiz_certificate"),
+            scoreLine: `${t("quiz_score")}: ${state.score} / ${state.maxScore}`,
+            dateLine: new Date().toLocaleDateString(viewer.currentLang()),
+            signature: tour.quiz?.certificate?.signature,
+          });
+        });
+        card.append(nameInput, dl);
+      }
+      const close = el("button", { className: "anda-primary-btn", type: "button", text: t("close"), style: "margin-left:10px;" });
+      const screen = el("div", { className: "anda-screen", role: "dialog", "aria-modal": "true", "aria-label": t("quiz_report") }, card);
+      card.appendChild(close);
+      const cerrar = mountScreen(container, screen, { onClose: () => showFinalScreen(viewer, t, container) });
+      close.addEventListener("click", cerrar);
+    }
+  });
+
+  // ------- Narracion bloqueante: aviso -------
+  viewer.on("narrationBlock", (e) => {
+    if (e.blocked) toast(container, t("narration_wait"));
+  });
+  // Intentar salir con algo pendiente: se dice por qué y, si es una pregunta
+  // con compuerta, se abre para que se pueda contestar
+  viewer.on("navBlocked", (e) => {
+    if (e.reason === "quiz" || e.reason === "form") {
+      toast(container, t(e.reason === "quiz" ? "quiz_gate_scene" : "form_gate_scene"));
+      if (e.hotspotId != null && !panelHost.isOpen) viewer.openHotspot(e.hotspotId);
+    } else if (e.reason === "treasure") {
+      // El tesoro no se abre: eso sería decir dónde está. Se da su pista.
+      toast(container, t("treasure_gate_scene"));
+      treasureHint?.(e.hotspotId);
+    } else if (e.reason === "narration") {
+      toast(container, t("narration_wait"));
+    } else {
+      // Una compuerta de un tipo que esta versión no conoce: no es la
+      // narración, así que no se dice que se espere a que termine.
+      toast(container, t("nav_gate_scene"));
+    }
+  });
+
+  // ------- Anuncio de cambio de escena (lectores de pantalla) -------
+  const announcer = el("div", { "aria-live": "polite", style: "position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);" });
+  container.appendChild(announcer);
+  viewer.on("sceneChange", (e) => {
+    announcer.textContent = `${viewer.text(e.scene.title)}. ${viewer.text(e.scene.altText)}`;
+  });
+
+  // ------- Cambio de idioma: remontar textos de la skin -------
+  viewer.on("langChange", (e) => {
+    aplicarIdioma(e.lang);
+    void ensureUiLang(e.lang).then(() => {
+      t = createTranslator(e.lang);
+      // Los componentes leen textos en su proximo render; para textos fijos
+      // basta actualizar el titulo.
+      const title = topbar.querySelector(".anda-title");
+      if (title != null) title.textContent = viewer.text(tour.meta.title);
+    });
+  });
+
+  // ------- Pantalla de bienvenida -------
+  const welcome = buildWelcomeScreen(viewer, t, baseUrl, () => {
+    viewer.audioEngine().unlock();
+  });
+  if (welcome != null && options.editMode !== true) container.appendChild(welcome);
+
+  // ------- Modo kiosko -------
+  //
+  // Un quiosco no es «un tour con autopilot»: es una pantalla que se explica
+  // sola. Encadena TODOS los recorridos sin fin, deja que cualquiera coja el
+  // control tocando, se lo dice con todas las letras, y vuelve al bucle si se
+  // queda solo. La lista de recorridos está siempre a mano para elegir uno.
+  let kioskTimer: ReturnType<typeof setTimeout> | null = null;
+  if (options.kiosk != null && options.kiosk !== false && options.editMode !== true) {
+    const inactivity = typeof options.kiosk === "object" ? (options.kiosk.inactivitySeconds ?? 60) : 60;
+    const rutas = viewer.autopilotRoutes();
+
+    const barra = el("div", { className: "anda-kiosk" });
+    const estado = el("div", { className: "anda-kiosk__state", role: "status" });
+    barra.appendChild(estado);
+    const lista = el("div", { className: "anda-kiosk__routes" });
+    barra.appendChild(lista);
+    // La barra ocupa el suelo de la pantalla: las miniaturas suben para no
+    // quedar debajo del texto, que era justo donde caían.
+    container.classList.add("anda-con-kiosko");
+    container.appendChild(barra);
+
+    let explorando = false;
+    let rutaActual: string | null = null;
+    // Terminado: el recorrido se ha visto entero y espera a que alguien lo pida
+    let terminado = false;
+    // Se repite sin fin solo si algún recorrido lo pide; si no, se ve una vez,
+    // acaba en la escena inicial y solo vuelve a empezar cuando alguien pulsa
+    const enBucle = rutas.some((r) => r.loop);
+    const volverAlInicio = (): void => {
+      panelHost.close();
+      void viewer.goTo(tour.start.scene, { view: tour.start.view, force: true, skipHistory: true });
+    };
+    const arrancar = (): void => {
+      explorando = false;
+      terminado = false;
+      // Arrancar a mano desarma el temporizador de inactividad: si no, a los
+      // sesenta segundos cortaba el recorrido que se acababa de pedir
+      if (kioskTimer != null) {
+        clearTimeout(kioskTimer);
+        kioskTimer = null;
+      }
+      panelHost.close();
+      viewer.startAutopilotChain();
+      pintar();
+    };
+
+    const pintarLista = (): void => {
+      lista.textContent = "";
+      if (rutas.length <= 1) return;
+      const titulo = el("span", { className: "anda-kiosk__routes-label" });
+      titulo.textContent = t("kiosk_routes");
+      lista.appendChild(titulo);
+      for (const ruta of rutas) {
+        const b = el("button", { className: "anda-kiosk__route", type: "button" });
+        b.textContent = viewer.text(ruta.title as never) || ruta.id;
+        if (ruta.id === rutaActual) b.classList.add("anda-kiosk__route--on");
+        b.addEventListener("click", () => {
+          explorando = false;
+          terminado = false;
+          if (kioskTimer != null) {
+            clearTimeout(kioskTimer);
+            kioskTimer = null;
+          }
+          panelHost.close();
+          viewer.startAutopilot(ruta.id);
+          pintar();
+        });
+        lista.appendChild(b);
+      }
+    };
+
+    const pintar = (): void => {
+      estado.textContent = "";
+      if (terminado) {
+        const txt = el("span", { className: "anda-kiosk__playing" });
+        txt.textContent = t("kiosk_ended");
+        estado.appendChild(txt);
+        const otraVez = el("button", { className: "anda-kiosk__resume", type: "button" });
+        otraVez.textContent = t("kiosk_replay");
+        otraVez.addEventListener("click", arrancar);
+        estado.appendChild(otraVez);
+      } else if (explorando) {
+        const txt = el("span", { className: "anda-kiosk__free" });
+        txt.textContent = t("kiosk_exploring");
+        estado.appendChild(txt);
+        const volver = el("button", { className: "anda-kiosk__resume", type: "button" });
+        volver.textContent = t("kiosk_resume");
+        volver.addEventListener("click", arrancar);
+        estado.appendChild(volver);
+      } else {
+        const nombre = rutas.find((r) => r.id === rutaActual);
+        const txt = el("span", { className: "anda-kiosk__playing" });
+        txt.textContent =
+          nombre != null
+            ? t("kiosk_playing", { name: viewer.text(nombre.title as never) || nombre.id })
+            : t("kiosk_touch_hint");
+        estado.appendChild(txt);
+        const pista = el("span", { className: "anda-kiosk__hint" });
+        pista.textContent = t("kiosk_touch_hint");
+        if (nombre != null) estado.appendChild(pista);
+      }
+      pintarLista();
+    };
+
+    viewer.on("autopilotChange", (e) => {
+      rutaActual = e.routeId;
+      if (!e.active && e.reason === "finished" && !explorando) {
+        // Se ha visto todo: de vuelta a la escena inicial, a esperar
+        terminado = true;
+        volverAlInicio();
+      }
+      if (!explorando) pintar();
+    });
+
+    // Interacción del visitante: pasa a explorar por su cuenta. Tras la
+    // inactividad configurada, el quiosco vuelve a empezar solo si está en
+    // bucle; si no, regresa a la escena inicial y espera a que alguien pulse.
+    const alInteractuar = (e: Event): void => {
+      // Pulsar la propia barra del quiosco no es «explorar»: además, repintar
+      // la barra en el pointerdown se llevaba por delante el botón antes de
+      // que llegara a hacer clic
+      if ((e.target as HTMLElement | null)?.closest?.(".anda-kiosk") != null) return;
+      if (!explorando) {
+        explorando = true;
+        terminado = false;
+        pintar();
+      }
+      if (kioskTimer != null) clearTimeout(kioskTimer);
+      kioskTimer = setTimeout(() => {
+        if (enBucle) {
+          volverAlInicio();
+          arrancar();
+        } else {
+          explorando = false;
+          terminado = true;
+          volverAlInicio();
+          pintar();
+        }
+      }, inactivity * 1000);
+    };
+    for (const evt of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+      container.addEventListener(evt, alInteractuar, { passive: true });
+    }
+
+    viewer.on("ready", () => {
+      viewer.startAutopilotChain();
+      pintar();
+    });
+    pintar();
+
+    // Bloqueo de salida: interceptar teclas de navegacion del navegador
+    window.addEventListener("keydown", (e) => {
+      if ((e.key === "F5" || (e.ctrlKey && e.key === "w") || e.key === "Escape") && document.fullscreenElement != null) {
+        e.preventDefault();
+      }
+    });
+  }
+
+  // ------- Sala en vivo -------
+  let live: LiveClient | null = null;
+  if (options.live != null) {
+    live = new LiveClient(viewer, t, container, options.live, panelHost);
+    live.connect();
+  }
+
+  // ------- postMessage API para embeds (necesaria para LTI e integraciones) -------
+  const onMessage = (e: MessageEvent): void => {
+    const data = e.data as { andarama?: string; [k: string]: unknown };
+    if (data == null || typeof data !== "object" || typeof data.andarama !== "string") return;
+    switch (data.andarama) {
+      case "goTo":
+        // Con `force`: quien integra el tour (LMS, LTI) manda sobre las
+        // compuertas pensadas para el visitante.
+        if (typeof data.scene === "string") void viewer.goTo(data.scene, { force: true });
+        break;
+      case "setView":
+        viewer.setView(data.view as { yaw?: number; pitch?: number; fov?: number });
+        break;
+      case "setLang":
+        if (typeof data.lang === "string") viewer.setLang(data.lang);
+        break;
+      case "getState":
+        (e.source as WindowProxy | null)?.postMessage(
+          { andarama: "state", scene: viewer.currentSceneId(), view: viewer.view(), lang: viewer.currentLang(), quiz: viewer.quizState() },
+          "*",
+        );
+        break;
+      default:
+        break;
+    }
+  };
+  if (!edit) {
+    window.addEventListener("message", onMessage);
+    // Emitir eventos hacia el padre si estamos embebidos
+    if (window.parent !== window) {
+      viewer.on("sceneChange", (e) =>
+        window.parent.postMessage({ andarama: "sceneChange", scene: e.scene.id }, "*"),
+      );
+      viewer.on("quizChange", (state) => window.parent.postMessage({ andarama: "quizChange", state }, "*"));
+      // Vista actual (limitada): permite sincronizar visores (comparador dividido)
+      let lastViewEmit = 0;
+      viewer.on("viewChange", (v) => {
+        const now = Date.now();
+        if (now - lastViewEmit < 80) return;
+        lastViewEmit = now;
+        window.parent.postMessage({ andarama: "viewChange", view: { yaw: v.yaw, pitch: v.pitch, fov: v.fov } }, "*");
+      });
+    }
+
+    // ------- Estado global para integraciones (adaptador SCORM, kiosko) -------
+    const visited = new Set<string>();
+    const publishState = (): void => {
+      if (viewer.currentSceneId() != null) visited.add(viewer.currentSceneId()!);
+      const state = {
+        scene: viewer.currentSceneId(),
+        scenesVisited: visited.size,
+        scenesTotal: tour.scenes.filter((s) => s.hidden !== true).length,
+        quiz: viewer.quizState(),
+        treasure: viewer.treasureState(),
+      };
+      (window as unknown as Record<string, unknown>).__Andarama_STATE__ = state;
+      window.dispatchEvent(new CustomEvent("andarama:state", { detail: state }));
+    };
+    viewer.on("sceneChange", publishState);
+    viewer.on("quizChange", publishState);
+    viewer.on("ready", publishState);
+  }
+
+  return {
+    viewer,
+    panelHost,
+    live,
+    destroy: () => {
+      for (const fn of cleanups) fn();
+      window.removeEventListener("message", onMessage);
+      if (kioskTimer != null) clearTimeout(kioskTimer);
+      live?.disconnect();
+      panelHost.close();
+      viewer.destroy();
+      container.replaceChildren();
+    },
+  };
+}

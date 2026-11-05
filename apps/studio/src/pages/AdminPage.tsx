@@ -1,0 +1,1279 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { Activity, Copy, Download, ExternalLink, Globe, Plus, RefreshCcw, Send, Ticket, Trash2, Upload, UserPlus } from "lucide-react";
+import { Badge, Button, Dialog, Field, Input, Select, Spinner, Switch, Tabs, TabList, TabTrigger, Textarea, useToast } from "@andarama/ui";
+import { api, apiBlob, ApiRequestError } from "../api";
+import { useT } from "../i18n";
+import { Cabecera } from "../components/Cabecera";
+import { LtiRegistrations } from "../components/LtiRegistrations";
+
+/** Panel de administración global de la instancia (§3.7). */
+export function AdminPage(): React.ReactNode {
+  const t = useT();
+  const [tab, setTab] = useState("overview");
+  return (
+    <div className="mx-auto max-w-6xl p-6">
+      <Cabecera title={t("admin")} hint={t("admin_intro")} />
+      <Tabs.Root value={tab} onValueChange={setTab}>
+        <TabList>
+          <TabTrigger value="overview">{t("instance_overview")}</TabTrigger>
+          <TabTrigger value="settings">{t("settings")}</TabTrigger>
+          <TabTrigger value="users">{t("users")}</TabTrigger>
+          <TabTrigger value="orgs">{t("organizations")}</TabTrigger>
+          <TabTrigger value="pubs">{t("publications")}</TabTrigger>
+          <TabTrigger value="gallery">{t("admin_gallery")}</TabTrigger>
+          <TabTrigger value="jobs">{t("jobs_queue")}</TabTrigger>
+          <TabTrigger value="audit">{t("audit_log")}</TabTrigger>
+          <TabTrigger value="hooks">{t("webhooks")}</TabTrigger>
+          <TabTrigger value="lti">LTI</TabTrigger>
+          <TabTrigger value="coupons">{t("coupons")}</TabTrigger>
+          <TabTrigger value="demos">Demos</TabTrigger>
+          <TabTrigger value="feedback">{t("admin_feedback")}</TabTrigger>
+          <TabTrigger value="backup">{t("backup")}</TabTrigger>
+        </TabList>
+        <div className="mt-5">
+          <Tabs.Content value="overview">
+            <Overview onNavigate={setTab} />
+          </Tabs.Content>
+          <Tabs.Content value="settings">
+            <InstanceSettings />
+          </Tabs.Content>
+          <Tabs.Content value="users">
+            <UsersTable />
+          </Tabs.Content>
+          <Tabs.Content value="orgs">
+            <OrgsTable />
+          </Tabs.Content>
+          <Tabs.Content value="pubs">
+            <PubsTable />
+          </Tabs.Content>
+          <Tabs.Content value="gallery">
+            <GalleryModeration />
+          </Tabs.Content>
+          <Tabs.Content value="jobs">
+            <JobsTable />
+          </Tabs.Content>
+          <Tabs.Content value="audit">
+            <AuditTable />
+          </Tabs.Content>
+          <Tabs.Content value="hooks">
+            <WebhooksPanel />
+          </Tabs.Content>
+          <Tabs.Content value="lti">
+            <LtiRegistrations />
+          </Tabs.Content>
+          <Tabs.Content value="coupons">
+            <CouponsPanel />
+          </Tabs.Content>
+          <Tabs.Content value="demos">
+            <DemosPanel />
+          </Tabs.Content>
+          <Tabs.Content value="feedback">
+            <FeedbackPanel />
+          </Tabs.Content>
+          <Tabs.Content value="backup">
+            <BackupPanel />
+          </Tabs.Content>
+        </div>
+      </Tabs.Root>
+    </div>
+  );
+}
+
+/** Envuelve una mutación: los errores SIEMPRE se muestran (nunca en silencio). */
+function useMutate(): (fn: () => Promise<unknown>, onOk?: () => void) => void {
+  const toast = useToast();
+  return (fn, onOk) => {
+    void fn()
+      .then(() => onOk?.())
+      .catch((err) => {
+        toast.push(err instanceof ApiRequestError ? (err.detail ?? err.title) : String(err), "error");
+      });
+  };
+}
+
+/** Entero con guarda: los campos vacíos no envían NaN al servidor. */
+function intOr(value: string, fallback: number): number {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+// ---------------------------------------------------------------------------
+// Resumen: dashboard con almacenamiento por organización y actividad
+// ---------------------------------------------------------------------------
+
+function Overview({ onNavigate }: { onNavigate: (tab: string) => void }): React.ReactNode {
+  const t = useT();
+  const q = useQuery({ queryKey: ["admin-overview"], queryFn: () => api<Record<string, number>>("/admin/overview") });
+  const orgsQ = useQuery({
+    queryKey: ["admin-orgs"],
+    queryFn: () => api<{ id: string; name: string; quotaBytes: number; usedBytes: number }[]>("/admin/orgs"),
+  });
+  const pubsQ = useQuery({
+    queryKey: ["admin-pubs"],
+    queryFn: () => api<{ projectId: string; slug: string; title: string; publishedAt: number }[]>("/admin/publications"),
+  });
+  const auditQ = useQuery({
+    queryKey: ["admin-audit"],
+    queryFn: () => api<{ id: string; action: string; entity: string; at: number }[]>("/admin/audit"),
+  });
+  const jobsQ = useQuery({
+    queryKey: ["admin-jobs"],
+    queryFn: () => api<{ id: string; status: string }[]>("/admin/jobs"),
+  });
+
+  const cards: { key: string; label: string; tab: string; format?: (v: number) => string }[] = [
+    { key: "users", label: t("users"), tab: "users" },
+    { key: "orgs", label: t("organizations"), tab: "orgs" },
+    { key: "projects", label: t("projects"), tab: "pubs" },
+    { key: "publications", label: t("publications"), tab: "pubs" },
+    { key: "queuedJobs", label: t("jobs_queue"), tab: "jobs" },
+    { key: "storageBytes", label: t("storage"), tab: "orgs", format: (v) => `${(v / 1024 / 1024 / 1024).toFixed(1)} GB` },
+  ];
+  const failedJobs = (jobsQ.data ?? []).filter((j) => j.status === "error").length;
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        {cards.map(({ key, label, tab, format }) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => onNavigate(tab)}
+            className="anda-tarjeta p-4 text-left"
+          >
+            <p className="text-2xl font-bold tabular-nums">
+              {q.data?.[key] != null ? (format != null ? format(q.data[key]!) : q.data[key]) : "—"}
+            </p>
+            <p className="text-xs text-[var(--anda-text-dim)]">{label}</p>
+          </button>
+        ))}
+      </div>
+
+      {failedJobs > 0 && (
+        <button
+          type="button"
+          onClick={() => onNavigate("jobs")}
+          className="flex w-full items-center gap-2 rounded-xl border border-red-300 bg-red-500/10 px-4 py-2.5 text-sm text-red-600 hover:bg-red-500/15"
+        >
+          <Activity className="h-4 w-4" /> {t("failed_jobs_warning", { count: String(failedJobs) })}
+        </button>
+      )}
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        {/* Almacenamiento por organización */}
+        <section className="anda-bloque p-4">
+          <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-[var(--anda-text-dim)]">{t("storage_by_org")}</h2>
+          <div className="space-y-3">
+            {(orgsQ.data ?? []).map((o) => {
+              const pct = Math.min(100, Math.round((o.usedBytes / Math.max(1, o.quotaBytes)) * 100));
+              return (
+                <div key={o.id}>
+                  <div className="mb-1 flex justify-between text-[13px]">
+                    <span className="font-medium">{o.name}</span>
+                    <span className="tabular-nums text-[var(--anda-text-dim)]">
+                      {(o.usedBytes / 1024 / 1024 / 1024).toFixed(2)} / {(o.quotaBytes / 1024 / 1024 / 1024).toFixed(0)} GB
+                    </span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-[var(--anda-surface-2)]">
+                    <div
+                      className={`h-full rounded-full ${pct > 90 ? "bg-red-500" : pct > 70 ? "bg-amber-500" : "bg-[var(--anda-primary)]"}`}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+            {orgsQ.data?.length === 0 && <p className="text-sm text-[var(--anda-text-dim)]">—</p>}
+          </div>
+        </section>
+
+        {/* Últimas publicaciones */}
+        <section className="anda-bloque p-4">
+          <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-[var(--anda-text-dim)]">{t("latest_publications")}</h2>
+          <div className="space-y-1.5">
+            {(pubsQ.data ?? [])
+              .slice()
+              .sort((a, b) => b.publishedAt - a.publishedAt)
+              .slice(0, 6)
+              .map((p) => (
+                <a
+                  key={p.projectId}
+                  href={`/t/${p.slug}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-[var(--anda-surface-2)]"
+                >
+                  <span className="truncate font-medium text-[var(--anda-primary-ink)]">{p.title}</span>
+                  <span className="shrink-0 text-xs text-[var(--anda-text-dim)]">{new Date(p.publishedAt).toLocaleDateString()}</span>
+                </a>
+              ))}
+            {pubsQ.data?.length === 0 && <p className="text-sm text-[var(--anda-text-dim)]">—</p>}
+          </div>
+        </section>
+      </div>
+
+      {/* Actividad reciente */}
+      <section className="anda-bloque p-4">
+        <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-[var(--anda-text-dim)]">{t("recent_activity")}</h2>
+        <div className="space-y-1 text-xs">
+          {(auditQ.data ?? []).slice(0, 10).map((a) => (
+            <div key={a.id} className="flex gap-3 border-b border-[var(--anda-border)] py-1.5 last:border-0">
+              <span className="w-36 shrink-0 text-[var(--anda-text-dim)]">{new Date(a.at).toLocaleString()}</span>
+              <span className="font-mono">{a.action}</span>
+              <span className="truncate text-[var(--anda-text-dim)]">{a.entity}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Ajustes de instancia (todos los campos del schema)
+// ---------------------------------------------------------------------------
+
+function InstanceSettings(): React.ReactNode {
+  const t = useT();
+  const toast = useToast();
+  const mutate = useMutate();
+  const q = useQuery({ queryKey: ["admin-settings"], queryFn: () => api<Record<string, unknown>>("/admin/settings") });
+  const [draft, setDraft] = useState<Record<string, unknown> | null>(null);
+  const data = draft ?? q.data ?? {};
+  const set = (k: string, v: unknown): void => setDraft({ ...data, [k]: v });
+  const legal = (data.legal as { privacy?: string; cookies?: string; terms?: string }) ?? {};
+  return (
+    <div className="max-w-xl space-y-4">
+      <Field label={t("instance_name")} htmlFor="in-name">
+        <Input id="in-name" value={String(data.name ?? "")} onChange={(e) => set("name", e.target.value)} />
+      </Field>
+      <Field label={t("registration_policy")} htmlFor="in-reg">
+        <Select id="in-reg" value={String(data.registration ?? "open")} onChange={(e) => set("registration", e.target.value)}>
+          <option value="open">{t("reg_open")}</option>
+          <option value="invite">{t("reg_invite")}</option>
+          <option value="domain">{t("reg_domain")}</option>
+        </Select>
+      </Field>
+      <Field label={t("allowed_domains")} htmlFor="in-domains" hint="museodelaciudad.es, ayuntamiento.es">
+        <Input
+          id="in-domains"
+          value={((data.allowedDomains as string[]) ?? []).join(", ")}
+          onChange={(e) => set("allowedDomains", e.target.value.split(",").map((d) => d.trim()).filter((d) => d !== ""))}
+        />
+      </Field>
+      <Field label={t("default_langs")} htmlFor="in-langs" hint="es, en">
+        <Input
+          id="in-langs"
+          value={((data.defaultLangs as string[]) ?? []).join(", ")}
+          onChange={(e) => set("defaultLangs", e.target.value.split(",").map((d) => d.trim()).filter((d) => d !== ""))}
+        />
+      </Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label={t("max_upload")} htmlFor="in-upload">
+          <Input id="in-upload" type="number" value={String(data.maxUploadMb ?? 512)} onChange={(e) => set("maxUploadMb", intOr(e.target.value, 512))} />
+        </Field>
+        <Field label={t("trash_days")} htmlFor="in-trash">
+          <Input id="in-trash" type="number" value={String(data.trashRetentionDays ?? 30)} onChange={(e) => set("trashRetentionDays", intOr(e.target.value, 30))} />
+        </Field>
+        <Field label={t("default_quota_gb")} htmlFor="in-qb">
+          <Input
+            id="in-qb"
+            type="number"
+            value={String(Math.round(Number(data.defaultQuotaBytes ?? 5368709120) / 1024 / 1024 / 1024))}
+            onChange={(e) => set("defaultQuotaBytes", intOr(e.target.value, 5) * 1024 * 1024 * 1024)}
+          />
+        </Field>
+        <Field label={t("default_quota_tours")} htmlFor="in-qt">
+          <Input id="in-qt" type="number" value={String(data.defaultQuotaTours ?? 100)} onChange={(e) => set("defaultQuotaTours", intOr(e.target.value, 100))} />
+        </Field>
+      </div>
+      <Field label={t("privacy_policy")} htmlFor="in-privacy">
+        <Textarea id="in-privacy" value={String(legal.privacy ?? "")} onChange={(e) => set("legal", { ...legal, privacy: e.target.value })} />
+      </Field>
+      <Field label={t("cookies_policy")} htmlFor="in-cookies">
+        <Textarea id="in-cookies" value={String(legal.cookies ?? "")} onChange={(e) => set("legal", { ...legal, cookies: e.target.value })} />
+      </Field>
+      <Field label={t("terms_of_use")} htmlFor="in-terms">
+        <Textarea id="in-terms" value={String(legal.terms ?? "")} onChange={(e) => set("legal", { ...legal, terms: e.target.value })} />
+      </Field>
+      <Button
+        onClick={() =>
+          mutate(
+            () => api("/admin/settings", { method: "PUT", body: draft }),
+            () => toast.push(t("saved"), "ok"),
+          )
+        }
+        disabled={draft == null}
+      >
+        {t("save")}
+      </Button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Usuarios: buscador + alta + borrado
+// ---------------------------------------------------------------------------
+
+interface AdminUser {
+  id: string;
+  email: string;
+  name: string;
+  roleGlobal: string;
+  totp: boolean;
+  sso: boolean;
+}
+
+function UsersTable(): React.ReactNode {
+  const t = useT();
+  const queryClient = useQueryClient();
+  const mutate = useMutate();
+  const toast = useToast();
+  const [search, setSearch] = useState("");
+  const [createOpen, setCreateOpen] = useState(false);
+  const [form, setForm] = useState({ email: "", name: "", password: "", roleGlobal: "user", orgId: "" });
+  const q = useQuery({ queryKey: ["admin-users"], queryFn: () => api<AdminUser[]>("/admin/users") });
+  const orgsQ = useQuery({ queryKey: ["admin-orgs"], queryFn: () => api<{ id: string; name: string }[]>("/admin/orgs") });
+  const rows = (q.data ?? []).filter(
+    (u) => search === "" || u.email.toLowerCase().includes(search.toLowerCase()) || u.name.toLowerCase().includes(search.toLowerCase()),
+  );
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2">
+        <Input placeholder={t("search")} value={search} onChange={(e) => setSearch(e.target.value)} className="max-w-64" aria-label={t("search")} />
+        <div className="flex-1" />
+        <Button onClick={() => setCreateOpen(true)}>
+          <UserPlus className="h-4 w-4" /> {t("create_user")}
+        </Button>
+      </div>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-[var(--anda-border)] text-left text-xs text-[var(--anda-text-dim)]">
+            <th className="py-2">{t("name")}</th>
+            <th>{t("email")}</th>
+            <th>{t("role")}</th>
+            <th aria-label={t("extras")} />
+            <th aria-label={t("actions")} />
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((u) => (
+            <tr key={u.id} className="border-b border-[var(--anda-border)]">
+              <td className="py-2">{u.name}</td>
+              <td>{u.email}</td>
+              <td>
+                <Select
+                  value={u.roleGlobal}
+                  onChange={(e) =>
+                    mutate(
+                      () => api(`/admin/users/${u.id}`, { method: "PATCH", body: { roleGlobal: e.target.value } }),
+                      () => void queryClient.invalidateQueries({ queryKey: ["admin-users"] }),
+                    )
+                  }
+                  className="max-w-36"
+                  aria-label={t("role")}
+                >
+                  <option value="user">user</option>
+                  <option value="admin">admin</option>
+                </Select>
+              </td>
+              <td className="text-right">
+                {u.totp && <Badge tone="ok">2FA</Badge>} {u.sso && <Badge>SSO</Badge>}
+              </td>
+              <td className="w-10 text-right">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={t("delete")}
+                  onClick={() => {
+                    if (!confirm(t("confirm_delete_user", { name: u.email }))) return;
+                    mutate(
+                      () => api(`/admin/users/${u.id}`, { method: "DELETE" }),
+                      () => void queryClient.invalidateQueries({ queryKey: ["admin-users"] }),
+                    );
+                  }}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <Dialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        title={t("create_user")}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setCreateOpen(false)}>
+              {t("cancel")}
+            </Button>
+            <Button
+              disabled={form.email === "" || form.name === "" || form.password.length < 10}
+              onClick={() =>
+                mutate(
+                  () =>
+                    api("/admin/users", {
+                      method: "POST",
+                      body: { ...form, orgId: form.orgId === "" ? undefined : form.orgId },
+                    }),
+                  () => {
+                    setCreateOpen(false);
+                    setForm({ email: "", name: "", password: "", roleGlobal: "user", orgId: "" });
+                    toast.push(t("user_created"), "ok");
+                    void queryClient.invalidateQueries({ queryKey: ["admin-users"] });
+                  },
+                )
+              }
+            >
+              {t("create")}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <Field label={t("name")} htmlFor="cu-name">
+            <Input id="cu-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} autoFocus />
+          </Field>
+          <Field label={t("email")} htmlFor="cu-email">
+            <Input id="cu-email" type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+          </Field>
+          <Field label={t("temp_password")} htmlFor="cu-pass" hint={t("temp_password_hint")}>
+            <Input id="cu-pass" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label={t("role")} htmlFor="cu-role">
+              <Select id="cu-role" value={form.roleGlobal} onChange={(e) => setForm({ ...form, roleGlobal: e.target.value })}>
+                <option value="user">user</option>
+                <option value="admin">admin</option>
+              </Select>
+            </Field>
+            <Field label={t("organization")} htmlFor="cu-org">
+              <Select id="cu-org" value={form.orgId} onChange={(e) => setForm({ ...form, orgId: e.target.value })}>
+                <option value="">—</option>
+                {(orgsQ.data ?? []).map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+        </div>
+      </Dialog>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Organizaciones: alta + renombrar + cuotas
+// ---------------------------------------------------------------------------
+
+function OrgsTable(): React.ReactNode {
+  const t = useT();
+  const queryClient = useQueryClient();
+  const mutate = useMutate();
+  const toast = useToast();
+  const [createOpen, setCreateOpen] = useState(false);
+  const [name, setName] = useState("");
+  const q = useQuery({
+    queryKey: ["admin-orgs"],
+    queryFn: () => api<{ id: string; name: string; quotaBytes: number; quotaTours: number; usedBytes: number }[]>("/admin/orgs"),
+  });
+  return (
+    <div className="space-y-3">
+      <div className="flex justify-end">
+        <Button onClick={() => setCreateOpen(true)}>
+          <Plus className="h-4 w-4" /> {t("create_org")}
+        </Button>
+      </div>
+      <div className="space-y-2">
+        {(q.data ?? []).map((o) => (
+          <div key={o.id} className="flex flex-wrap items-center gap-3 anda-ficha px-4 py-2.5 text-sm">
+            <Input
+              defaultValue={o.name}
+              className="max-w-56 font-medium"
+              aria-label={t("name")}
+              onBlur={(e) => {
+                if (e.target.value.trim() === "" || e.target.value === o.name) return;
+                mutate(
+                  () => api(`/admin/orgs/${o.id}`, { method: "PATCH", body: { name: e.target.value.trim() } }),
+                  () => void queryClient.invalidateQueries({ queryKey: ["admin-orgs"] }),
+                );
+              }}
+            />
+            <span className="flex-1" />
+            <span className="text-xs tabular-nums text-[var(--anda-text-dim)]">
+              {(o.usedBytes / 1024 / 1024 / 1024).toFixed(2)} GB {t("of")}
+            </span>
+            <Input
+              type="number"
+              className="max-w-24"
+              defaultValue={String(Math.round(o.quotaBytes / 1024 / 1024 / 1024))}
+              aria-label={t("quota_gb")}
+              onBlur={(e) =>
+                mutate(
+                  () => api(`/admin/orgs/${o.id}`, { method: "PATCH", body: { quotaBytes: intOr(e.target.value, 5) * 1024 * 1024 * 1024 } }),
+                  () => void queryClient.invalidateQueries({ queryKey: ["admin-orgs"] }),
+                )
+              }
+            />
+            <span className="text-xs text-[var(--anda-text-dim)]">GB</span>
+            <Input
+              type="number"
+              className="max-w-20"
+              defaultValue={String(o.quotaTours)}
+              aria-label={t("quota_tours")}
+              onBlur={(e) =>
+                mutate(
+                  () => api(`/admin/orgs/${o.id}`, { method: "PATCH", body: { quotaTours: intOr(e.target.value, 100) } }),
+                  () => void queryClient.invalidateQueries({ queryKey: ["admin-orgs"] }),
+                )
+              }
+            />
+            <span className="text-xs text-[var(--anda-text-dim)]">{t("tours")}</span>
+          </div>
+        ))}
+      </div>
+
+      <Dialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        title={t("create_org")}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setCreateOpen(false)}>
+              {t("cancel")}
+            </Button>
+            <Button
+              disabled={name.trim() === ""}
+              onClick={() =>
+                mutate(
+                  () => api("/admin/orgs", { method: "POST", body: { name: name.trim() } }),
+                  () => {
+                    setCreateOpen(false);
+                    setName("");
+                    toast.push(t("saved"), "ok");
+                    void queryClient.invalidateQueries({ queryKey: ["admin-orgs"] });
+                  },
+                )
+              }
+            >
+              {t("create")}
+            </Button>
+          </>
+        }
+      >
+        <Field label={t("org_name")} htmlFor="co-name">
+          <Input id="co-name" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+        </Field>
+      </Dialog>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Publicaciones: buscar + abrir + despublicar
+// ---------------------------------------------------------------------------
+
+function PubsTable(): React.ReactNode {
+  const t = useT();
+  const queryClient = useQueryClient();
+  const mutate = useMutate();
+  const [search, setSearch] = useState("");
+  const q = useQuery({
+    queryKey: ["admin-pubs"],
+    queryFn: () => api<{ projectId: string; slug: string; title: string; visibility: string; publishedAt: number }[]>("/admin/publications"),
+  });
+  const rows = (q.data ?? []).filter(
+    (p) => search === "" || p.title.toLowerCase().includes(search.toLowerCase()) || p.slug.includes(search.toLowerCase()),
+  );
+  return (
+    <div className="space-y-3">
+      <Input placeholder={t("search")} value={search} onChange={(e) => setSearch(e.target.value)} className="max-w-64" aria-label={t("search")} />
+      <div className="space-y-2 text-sm">
+        {rows.map((p) => (
+          <div key={p.projectId} className="flex items-center gap-3 anda-ficha px-4 py-2.5">
+            <a href={`/t/${p.slug}`} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1.5 font-medium text-[var(--anda-primary-ink)] hover:underline">
+              {p.title} <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+            <span className="font-mono text-xs text-[var(--anda-text-dim)]">/t/{p.slug}</span>
+            <div className="flex-1" />
+            <Badge>{p.visibility}</Badge>
+            <span className="text-xs text-[var(--anda-text-dim)]">{new Date(p.publishedAt).toLocaleString()}</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                if (!confirm(t("confirm_unpublish", { title: p.title }))) return;
+                mutate(
+                  () => api(`/admin/publications/${p.projectId}/unpublish`, { method: "POST", body: {} }),
+                  () => void queryClient.invalidateQueries({ queryKey: ["admin-pubs"] }),
+                );
+              }}
+            >
+              {t("unpublish")}
+            </Button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Moderación de la galería (/explorar/): nada se lista sin aprobarlo
+// ---------------------------------------------------------------------------
+
+interface GalleryReviewRow {
+  projectId: string;
+  slug: string;
+  title: string;
+  orgName: string;
+  authorEmail: string | null;
+  publishedAt: number;
+  reviewedAt: number | null;
+  hasPoster: boolean;
+  gallery: {
+    title: string | null;
+    description: string | null;
+    credits: string | null;
+    placeName: string | null;
+    placeCountry: string | null;
+    lang: string | null;
+  };
+}
+
+function GalleryModeration(): React.ReactNode {
+  const t = useT();
+  const queryClient = useQueryClient();
+  const mutate = useMutate();
+  const [status, setStatus] = useState<"pending" | "approved" | "rejected">("pending");
+  const q = useQuery({
+    queryKey: ["admin-gallery", status],
+    queryFn: () => api<GalleryReviewRow[]>(`/admin/gallery?status=${status}`),
+  });
+  const decidir = (projectId: string, decision: "approve" | "reject"): void =>
+    mutate(
+      () => api(`/admin/gallery/${projectId}/${decision}`, { method: "POST", body: {} }),
+      () => void queryClient.invalidateQueries({ queryKey: ["admin-gallery"] }),
+    );
+  return (
+    <div className="space-y-3">
+      <p className="text-[13px] text-[var(--anda-text-dim)]">{t("admin_gallery_hint")}</p>
+      <div className="anda-seg" role="group" aria-label={t("admin_gallery")}>
+        {(["pending", "approved", "rejected"] as const).map((s) => (
+          <button key={s} type="button" aria-pressed={status === s} onClick={() => setStatus(s)}>
+            {t(`admin_gallery_${s}`)}
+          </button>
+        ))}
+      </div>
+      {q.isLoading ? (
+        <Spinner />
+      ) : (q.data ?? []).length === 0 ? (
+        <p className="text-sm text-[var(--anda-text-dim)]">{t("admin_gallery_empty")}</p>
+      ) : (
+        <div className="space-y-3 text-sm">
+          {(q.data ?? []).map((row) => (
+            <article key={row.projectId} className="anda-ficha flex flex-col gap-3 p-4 sm:flex-row">
+              {row.hasPoster && (
+                <img src={`/t/${row.slug}/share.jpg`} alt="" loading="lazy" className="h-28 w-48 shrink-0 rounded-lg object-cover" />
+              )}
+              <div className="min-w-0 flex-1 space-y-1">
+                <h3 className="text-[15px] font-bold">{row.gallery.title ?? row.title}</h3>
+                <p className="text-xs text-[var(--anda-text-dim)]">
+                  {[row.gallery.placeName, row.gallery.placeCountry, row.gallery.lang].filter((x) => x != null && x !== "").join(" · ")}
+                  {" · "}
+                  {row.orgName}
+                  {row.authorEmail != null && <> · {t("admin_gallery_by", { email: row.authorEmail })}</>}
+                </p>
+                <p className="whitespace-pre-line text-[13px]">{row.gallery.description}</p>
+                {row.gallery.credits != null && <p className="text-xs text-[var(--anda-text-dim)]">{row.gallery.credits}</p>}
+                <a
+                  href={`/t/${row.slug}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 font-medium text-[var(--anda-primary-ink)] hover:underline"
+                >
+                  /t/{row.slug} <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+              </div>
+              <div className="flex shrink-0 items-start gap-2">
+                {status !== "approved" && (
+                  <Button size="sm" onClick={() => decidir(row.projectId, "approve")}>
+                    {t("admin_gallery_approve")}
+                  </Button>
+                )}
+                {status !== "rejected" && (
+                  <Button size="sm" variant="outline" onClick={() => decidir(row.projectId, "reject")}>
+                    {t("admin_gallery_reject")}
+                  </Button>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Cola de trabajos: filtro por estado + reintentos
+// ---------------------------------------------------------------------------
+
+function JobsTable(): React.ReactNode {
+  const t = useT();
+  const queryClient = useQueryClient();
+  const mutate = useMutate();
+  const [status, setStatus] = useState("");
+  const q = useQuery({
+    queryKey: ["admin-jobs"],
+    queryFn: () => api<{ id: string; kind: string; status: string; error: string | null; createdAt: number }[]>("/admin/jobs"),
+    refetchInterval: 5000,
+  });
+  const rows = (q.data ?? []).filter((j) => status === "" || j.status === status);
+  return (
+    <div className="space-y-3">
+      <Select value={status} onChange={(e) => setStatus(e.target.value)} className="max-w-44" aria-label={t("status")}>
+        <option value="">{t("all_statuses")}</option>
+        {["queued", "running", "done", "error"].map((s) => (
+          <option key={s} value={s}>
+            {s}
+          </option>
+        ))}
+      </Select>
+      <div className="space-y-2 text-sm">
+        {rows.map((j) => (
+          <div key={j.id} className="flex items-center gap-3 anda-ficha px-4 py-2.5">
+            <span className="font-mono text-xs">{j.kind}</span>
+            <Badge tone={j.status === "done" ? "ok" : j.status === "error" ? "danger" : "warn"}>{j.status}</Badge>
+            <span className="flex-1 truncate text-xs text-[var(--anda-text-dim)]">{j.error ?? ""}</span>
+            <span className="text-xs text-[var(--anda-text-dim)]">{new Date(j.createdAt).toLocaleTimeString()}</span>
+            {j.status === "error" && (
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label={t("retry")}
+                onClick={() =>
+                  mutate(
+                    () => api(`/admin/jobs/${j.id}/retry`, { method: "POST", body: {} }),
+                    () => void queryClient.invalidateQueries({ queryKey: ["admin-jobs"] }),
+                  )
+                }
+              >
+                <RefreshCcw className="h-4 w-4" />
+              </Button>
+            )}
+          </div>
+        ))}
+        {rows.length === 0 && <p className="text-sm text-[var(--anda-text-dim)]">—</p>}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Auditoría con buscador
+// ---------------------------------------------------------------------------
+
+function AuditTable(): React.ReactNode {
+  const t = useT();
+  const [search, setSearch] = useState("");
+  const q = useQuery({
+    queryKey: ["admin-audit"],
+    queryFn: () => api<{ id: string; action: string; entity: string; entityId: string | null; userId: string | null; at: number }[]>("/admin/audit"),
+  });
+  const rows = (q.data ?? []).filter(
+    (a) => search === "" || a.action.includes(search.toLowerCase()) || a.entity.includes(search.toLowerCase()),
+  );
+  return (
+    <div className="space-y-3">
+      <Input placeholder={t("search")} value={search} onChange={(e) => setSearch(e.target.value)} className="max-w-64" aria-label={t("search")} />
+      <div className="max-h-[60vh] space-y-1 overflow-y-auto text-xs">
+        {rows.map((a) => (
+          <div key={a.id} className="flex gap-3 border-b border-[var(--anda-border)] py-1.5">
+            <span className="w-40 shrink-0 text-[var(--anda-text-dim)]">{new Date(a.at).toLocaleString()}</span>
+            <span className="font-mono">{a.action}</span>
+            <span className="truncate text-[var(--anda-text-dim)]">
+              {a.entity} {a.entityId ?? ""}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks: alta + conmutador + prueba de envío
+// ---------------------------------------------------------------------------
+
+function WebhooksPanel(): React.ReactNode {
+  const t = useT();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+  const mutate = useMutate();
+  const q = useQuery({
+    queryKey: ["admin-hooks"],
+    queryFn: () => api<{ id: string; url: string; eventsJson: string; active: boolean }[]>("/admin/webhooks"),
+  });
+  const [url, setUrl] = useState("");
+  const [secret, setSecret] = useState("");
+  const [events, setEvents] = useState<string[]>(["publish"]);
+  const parseEvents = (json: string): string[] => {
+    try {
+      return JSON.parse(json) as string[];
+    } catch {
+      return [];
+    }
+  };
+  return (
+    <div className="max-w-2xl space-y-4">
+      {(q.data ?? []).map((h) => (
+        <div key={h.id} className="flex items-center gap-3 anda-ficha px-4 py-2.5 text-sm">
+          <Globe className={`h-4 w-4 shrink-0 ${h.active ? "text-emerald-500" : "text-[var(--anda-text-dim)]"}`} />
+          <span className="flex-1 truncate font-mono text-xs">{h.url}</span>
+          <span className="text-xs text-[var(--anda-text-dim)]">{parseEvents(h.eventsJson).join(", ")}</span>
+          <Switch
+            id={`wh-active-${h.id}`}
+            checked={h.active}
+            onCheckedChange={(v) =>
+              mutate(
+                () => api(`/admin/webhooks/${h.id}`, { method: "PATCH", body: { active: v } }),
+                () => void queryClient.invalidateQueries({ queryKey: ["admin-hooks"] }),
+              )
+            }
+            label={h.active ? t("active") : t("inactive")}
+          />
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label={t("send_test")}
+            onClick={() =>
+              mutate(async () => {
+                const r = await api<{ ok: boolean; status: number; error?: string }>(`/admin/webhooks/${h.id}/test`, { method: "POST", body: {} });
+                toast.push(r.ok ? t("test_ok", { status: String(r.status) }) : t("test_failed", { detail: r.error ?? String(r.status) }), r.ok ? "ok" : "error");
+              })
+            }
+          >
+            <Send className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label={t("delete")}
+            onClick={() =>
+              mutate(
+                () => api(`/admin/webhooks/${h.id}`, { method: "DELETE" }),
+                () => void queryClient.invalidateQueries({ queryKey: ["admin-hooks"] }),
+              )
+            }
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      ))}
+      <div className="space-y-3 rounded-lg border border-dashed border-[var(--anda-border)] p-4">
+        <Field label={t("webhook_url")} htmlFor="wh-url">
+          <Input id="wh-url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://..." />
+        </Field>
+        <Field label={t("webhook_secret")} htmlFor="wh-secret" hint={t("webhook_secret_hint")}>
+          <Input id="wh-secret" value={secret} onChange={(e) => setSecret(e.target.value)} />
+        </Field>
+        <div className="flex gap-4">
+          {["publish", "unpublish", "form_submission"].map((ev) => (
+            <label key={ev} className="flex items-center gap-1.5 text-sm">
+              <input
+                type="checkbox"
+                checked={events.includes(ev)}
+                onChange={(e) => setEvents((prev) => (e.target.checked ? [...prev, ev] : prev.filter((x) => x !== ev)))}
+              />
+              {ev}
+            </label>
+          ))}
+        </div>
+        <Button
+          onClick={() =>
+            mutate(
+              () => api("/admin/webhooks", { method: "POST", body: { url, events, secret: secret === "" ? undefined : secret } }),
+              () => {
+                setUrl("");
+                setSecret("");
+                void queryClient.invalidateQueries({ queryKey: ["admin-hooks"] });
+              },
+            )
+          }
+          disabled={url === ""}
+        >
+          <Plus className="h-4 w-4" /> {t("create")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Copia de seguridad
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Solicitudes de demo de la web pública (formación, universidades, museos)
+// ---------------------------------------------------------------------------
+
+interface DemoRequestRow {
+  id: string;
+  name: string;
+  institution: string;
+  email: string;
+  message: string;
+  lang: string | null;
+  source: string | null;
+  page: string | null;
+  adConsent: boolean;
+  clickId: boolean;
+  utmSource: string | null;
+  utmCampaign: string | null;
+  notifiedAt: number | null;
+  createdAt: number;
+}
+
+/**
+ * Lista de solicitudes de demo. Si la instancia no tiene correo saliente,
+ * es aquí donde se ven (el aviso por correo queda sin enviar). Las etiquetas
+ * son técnicas (gclid, utm) para no añadir claves a los 32 diccionarios.
+ */
+function DemosPanel(): React.ReactNode {
+  const t = useT();
+  const q = useQuery({ queryKey: ["admin-demos"], queryFn: () => api<DemoRequestRow[]>("/admin/demo-requests") });
+  if (q.isLoading) return <Spinner />;
+  const rows = q.data ?? [];
+  if (rows.length === 0) return <p className="text-sm text-[var(--anda-text-dim)]">{t("no_results")}</p>;
+  return (
+    <div className="space-y-3">
+      {rows.map((d) => (
+        <article key={d.id} className="rounded-lg border border-[var(--anda-border)] p-3 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <strong>{d.institution}</strong>
+            <span>{d.name}</span>
+            <a className="underline" href={`mailto:${d.email}`}>
+              {d.email}
+            </a>
+            <span className="ml-auto text-xs text-[var(--anda-text-dim)]">{new Date(d.createdAt).toLocaleString()}</span>
+          </div>
+          <div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+            {d.source != null && <Badge>{d.source}</Badge>}
+            {d.lang != null && <Badge>{d.lang}</Badge>}
+            {d.clickId && <Badge>gclid ✓</Badge>}
+            {d.utmSource != null && <Badge>utm: {d.utmSource}{d.utmCampaign != null ? ` · ${d.utmCampaign}` : ""}</Badge>}
+            <Badge>{d.notifiedAt != null ? `${t("email")} ✓` : `${t("email")} ✗`}</Badge>
+            {d.page != null && <span className="font-mono text-[var(--anda-text-dim)]">{d.page}</span>}
+          </div>
+          <p className="mt-2 whitespace-pre-wrap text-[var(--anda-text-dim)]">{d.message}</p>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Informes de problemas enviados desde el Studio
+// ---------------------------------------------------------------------------
+
+interface FeedbackRow {
+  id: string;
+  userId: string | null;
+  userName: string | null;
+  userEmail: string | null;
+  description: string;
+  context: Record<string, unknown>;
+  hasImage: boolean;
+  notifiedAt: number | null;
+  createdAt: number;
+}
+
+/**
+ * Informes de «Informar de un problema». La captura se pide con la sesión
+ * (no es un enlace público) y se abre en una pestaña nueva. Las etiquetas del
+ * contexto son las claves técnicas, como en la pestaña Demos.
+ */
+function FeedbackPanel(): React.ReactNode {
+  const t = useT();
+  const toast = useToast();
+  const q = useQuery({ queryKey: ["admin-feedback"], queryFn: () => api<FeedbackRow[]>("/admin/feedback") });
+  if (q.isLoading) return <Spinner />;
+  const rows = q.data ?? [];
+  if (rows.length === 0) return <p className="text-sm text-[var(--anda-text-dim)]">{t("no_results")}</p>;
+  const verCaptura = async (id: string): Promise<void> => {
+    // La pestaña se abre ya, dentro del clic, para que el navegador no la bloquee
+    const ventana = window.open("", "_blank");
+    try {
+      const blob = await apiBlob(`/admin/feedback/${encodeURIComponent(id)}/image`);
+      const url = URL.createObjectURL(blob);
+      if (ventana != null) ventana.location.href = url;
+      else window.open(url, "_blank");
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err) {
+      ventana?.close();
+      toast.push(String(err instanceof Error ? err.message : err), "error");
+    }
+  };
+  return (
+    <div className="space-y-3">
+      {rows.map((f) => (
+        <article key={f.id} className="rounded-lg border border-[var(--anda-border)] p-3 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <strong>{f.userName ?? "?"}</strong>
+            {f.userEmail != null && (
+              <a className="underline" href={`mailto:${f.userEmail}`}>
+                {f.userEmail}
+              </a>
+            )}
+            <span className="ml-auto text-xs text-[var(--anda-text-dim)]">{new Date(f.createdAt).toLocaleString()}</span>
+          </div>
+          <p className="mt-2 whitespace-pre-wrap">{f.description}</p>
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs">
+            {typeof f.context.version === "string" && <Badge>{f.context.version}</Badge>}
+            <Badge>{f.notifiedAt != null ? `${t("email")} ✓` : `${t("email")} ✗`}</Badge>
+            {f.hasImage && (
+              <Button size="sm" variant="outline" onClick={() => void verCaptura(f.id)}>
+                <ExternalLink className="h-3.5 w-3.5" /> {t("admin_feedback_image")}
+              </Button>
+            )}
+          </div>
+          <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 break-all font-mono text-xs text-[var(--anda-text-dim)]">
+            {Object.entries(f.context)
+              .filter(([k, v]) => k !== "version" && v != null && v !== "")
+              .map(([k, v]) => (
+                <div key={k} className="contents">
+                  <dt>{k}</dt>
+                  <dd>{String(v)}</dd>
+                </div>
+              ))}
+          </dl>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function BackupPanel(): React.ReactNode {
+  const t = useT();
+  const toast = useToast();
+  const mutate = useMutate();
+  const [importing, setImporting] = useState(false);
+  return (
+    <div className="max-w-md space-y-4">
+      <Button variant="outline" onClick={() => window.open("/api/v1/admin/backup", "_blank")}>
+        <Download className="h-4 w-4" /> {t("backup_download")}
+      </Button>
+      <div>
+        <label className="inline-flex cursor-pointer items-center gap-2 rounded-[var(--anda-radius)] border border-[var(--anda-border)] px-4 py-2 text-sm hover:bg-[var(--anda-surface-2)]">
+          {importing ? <Spinner /> : <Upload className="h-4 w-4" />} {t("backup_import")}
+          <input
+            type="file"
+            accept="application/json"
+            hidden
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file == null) return;
+              setImporting(true);
+              void file
+                .text()
+                .then((text) =>
+                  mutate(
+                    async () => {
+                      const r = await api<{ imported: number }>("/admin/backup/import", { method: "POST", body: JSON.parse(text) });
+                      toast.push(t("rows_imported", { count: String(r.imported) }), "ok");
+                    },
+                  ),
+                )
+                .finally(() => setImporting(false));
+            }}
+          />
+        </label>
+      </div>
+      <p className="text-xs text-[var(--anda-text-dim)]">{t("backup_hint")}</p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Cupones: tandas de códigos canjeables que conceden un plan
+// ---------------------------------------------------------------------------
+
+interface CouponRow {
+  code: string;
+  plan: string;
+  batch: string | null;
+  note: string | null;
+  expiresAt: number | null;
+  redeemedAt: number | null;
+  redeemedBy: string | null;
+  email: string | null;
+  createdAt: number;
+}
+
+function CouponsPanel(): React.ReactNode {
+  const t = useT();
+  const toast = useToast();
+  const mutate = useMutate();
+  const queryClient = useQueryClient();
+  const [count, setCount] = useState("100");
+  const [plan, setPlan] = useState("vitalicio");
+  const [batch, setBatch] = useState("");
+  const [note, setNote] = useState("");
+  /** Los códigos recién generados: es la única vez que se enseñan juntos. */
+  const [fresh, setFresh] = useState<string[] | null>(null);
+
+  const list = useQuery({
+    queryKey: ["coupons"],
+    queryFn: () => api<{ coupons: CouponRow[]; total: number; redeemed: number }>("/admin/coupons"),
+  });
+
+  const generar = (): void => {
+    mutate(
+      async () => {
+        const res = await api<{ codes: string[] }>("/admin/coupons", {
+          method: "POST",
+          body: {
+            count: intOr(count, 1),
+            plan,
+            batch: batch.trim() || undefined,
+            note: note.trim() || undefined,
+          },
+        });
+        setFresh(res.codes);
+        toast.push(t("coupons_created", { count: String(res.codes.length) }), "ok");
+      },
+      () => void queryClient.invalidateQueries({ queryKey: ["coupons"] }),
+    );
+  };
+
+  const descargar = (codes: string[]): void => {
+    const filas = ["codigo,plan,lote", ...codes.map((c) => `${c},${plan},${batch.trim()}`)];
+    const url = URL.createObjectURL(new Blob([filas.join("\n")], { type: "text/csv;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `cupones-${batch.trim() || plan}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="anda-bloque p-5">
+        <h3 className="mb-1 flex items-center gap-2 text-[15px] font-semibold">
+          <Ticket className="h-4 w-4" /> {t("coupons_new")}
+        </h3>
+        <p className="mb-4 max-w-2xl text-[13px] text-[var(--anda-text-dim)]">{t("coupons_hint")}</p>
+        <div className="flex flex-wrap items-end gap-3">
+          <Field label={t("coupons_count")} htmlFor="cp-count">
+            <Input id="cp-count" inputMode="numeric" value={count} onChange={(e) => setCount(e.target.value)} className="w-24" />
+          </Field>
+          <Field label={t("plan")} htmlFor="cp-plan">
+            <Select id="cp-plan" value={plan} onChange={(e) => setPlan(e.target.value)} className="w-44">
+              <option value="vitalicio">De por vida</option>
+              <option value="formacion">Formación</option>
+              <option value="excursion">Excursión</option>
+              <option value="paseo">Paseo</option>
+              <option value="aula">Aula</option>
+              <option value="andar">Andar</option>
+            </Select>
+          </Field>
+          <Field label={t("coupons_batch")} htmlFor="cp-batch">
+            <Input id="cp-batch" value={batch} onChange={(e) => setBatch(e.target.value)} className="w-48" placeholder="lanzamiento" />
+          </Field>
+          <Field label={t("coupons_note")} htmlFor="cp-note">
+            <Input id="cp-note" value={note} onChange={(e) => setNote(e.target.value)} className="w-60" />
+          </Field>
+          <Button onClick={generar}>
+            <Plus className="h-4 w-4" /> {t("coupons_generate")}
+          </Button>
+        </div>
+
+        {fresh != null && (
+          <div className="mt-5 rounded-xl border border-[var(--anda-border)] bg-[var(--anda-surface-2)] p-4">
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <span className="text-[13px] font-semibold">{t("coupons_fresh", { count: String(fresh.length) })}</span>
+              <div className="flex-1" />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  void navigator.clipboard.writeText(fresh.join("\n")).then(() => toast.push(t("copied"), "ok"));
+                }}
+              >
+                <Copy className="h-4 w-4" /> {t("copy")}
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => descargar(fresh)}>
+                <Download className="h-4 w-4" /> CSV
+              </Button>
+            </div>
+            <pre className="max-h-60 overflow-auto font-mono text-[12.5px] leading-relaxed">{fresh.join("\n")}</pre>
+          </div>
+        )}
+      </div>
+
+      <div className="anda-bloque p-5">
+        <h3 className="mb-3 text-[15px] font-semibold">
+          {t("coupons")}{" "}
+          {list.data != null && (
+            <span className="font-normal text-[var(--anda-text-dim)]">
+              ({t("coupons_redeemed_of", { redeemed: String(list.data.redeemed), total: String(list.data.total) })})
+            </span>
+          )}
+        </h3>
+        <div className="max-h-[28rem] overflow-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="sticky top-0 bg-[var(--anda-surface)] text-xs uppercase text-[var(--anda-text-dim)]">
+              <tr>
+                <th className="py-2">{t("coupons_code")}</th>
+                <th>{t("plan")}</th>
+                <th>{t("coupons_batch")}</th>
+                <th>{t("status")}</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {(list.data?.coupons ?? []).map((cp) => (
+                <tr key={cp.code} className="border-t border-[var(--anda-border)]">
+                  <td className="py-2 font-mono text-[12.5px]">{cp.code}</td>
+                  <td>{cp.plan}</td>
+                  <td className="text-[var(--anda-text-dim)]">{cp.batch ?? "—"}</td>
+                  <td>
+                    {cp.redeemedAt != null ? (
+                      <Badge tone="ok">{cp.email ?? t("coupons_redeemed")}</Badge>
+                    ) : (
+                      <Badge>{t("coupons_free")}</Badge>
+                    )}
+                  </td>
+                  <td className="text-right">
+                    {cp.redeemedAt == null && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={t("delete")}
+                        onClick={() =>
+                          mutate(
+                            () => api(`/admin/coupons/${cp.code}`, { method: "DELETE" }),
+                            () => void queryClient.invalidateQueries({ queryKey: ["coupons"] }),
+                          )
+                        }
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}

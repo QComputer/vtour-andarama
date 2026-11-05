@@ -1,0 +1,87 @@
+---
+title: Visita guiada en directo con Meet o Teams
+description: Un guía mueve el recorrido y los asistentes lo siguen en su propio navegador; la voz va por Meet, Teams o Zoom.
+---
+
+Un **guía** controla la escena y la orientación de la vista de todos los
+asistentes en tiempo real. Cada asistente ve el recorrido en su propio
+navegador, a calidad completa, en lugar de un vídeo de la pantalla del guía.
+Los asistentes no necesitan cuenta en Andarama.
+
+## Crear la sala
+
+1. Publica el recorrido (la visita en directo usa la versión publicada).
+2. En el editor, pulsa el icono de emisión (**Visita guiada en vivo**) y
+   **Crear sala**. Obtendrás dos enlaces con un código de sala efímero:
+   - **Enlace de guía (privado)**: lleva tu clave de guía. Ábrelo tú y no lo
+     compartas: quien lo tenga puede mover la vista de todos.
+   - **Enlace para asistentes**: el que se reparte.
+3. Todo lo que hagas en el enlace de guía (cambiar de escena, girar la vista,
+   hacer zoom, **abrir o cerrar un panel**) se replica en los asistentes. Con
+   `Alt + clic` marcas un **puntero** visible para todos. Hay **chat de texto**
+   integrado.
+4. Cada asistente puede pulsar **Explorar libremente** para soltarse y mirar
+   por su cuenta, y **Seguir al guía** para volver a tu vista.
+
+## Los paneles se abren a la vez
+
+Cuando el guía pulsa un hotspot con contenido (un texto, una imagen, una
+galería, un vídeo, un quiz), el mismo panel se abre en la pantalla de quien le
+sigue; y cuando el guía lo cierra, se les cierra también. Así todo el grupo lee
+la misma cartela al mismo tiempo, sin tener que buscarla.
+
+- Leer el panel, desplazarse por él, cerrar una burbuja o escribir en el chat
+  **no** suelta al asistente del guía.
+- Quien se ha soltado para explorar no recibe los paneles; al pulsar **Seguir
+  al guía**, se le abre el que el guía tenga abierto en ese momento.
+- Quien entra tarde a la sala ve también el panel que el guía tenga abierto.
+- Al seguir al guía solo se cierra lo que se abrió por seguirle: si un
+  asistente abre algo por su cuenta, el guía no se lo cierra.
+
+La sala es efímera: cuando el guía se va, se cierra y los asistentes ven «La
+visita guiada ha terminado».
+
+## Con Meet o Teams (o Zoom)
+
+Andarama no transmite audio: la voz va por la videollamada de siempre. El
+montaje es este:
+
+1. Abre una reunión de **Google Meet**, **Microsoft Teams** o **Zoom** para la
+   voz, como cualquier clase en línea.
+2. Pega en el chat de la reunión el **enlace para asistentes**.
+3. Abre tú el **enlace de guía** en otra pestaña o ventana. No hace falta
+   compartir pantalla.
+4. Habla por la reunión mientras mueves el recorrido: cuando cambias de escena,
+   giras la vista o haces zoom, los asistentes te siguen en su propio
+   navegador, con la imagen a calidad completa y sin los cortes de compartir
+   pantalla.
+
+Cada alumno puede soltarse para explorar y volver a seguirte con un botón. Con
+`Alt + clic` señalas un punto que ven todos, al abrir un panel se les abre a
+ellos, y el chat de texto de Andarama sirve para preguntas rápidas sin
+interrumpir la reunión.
+
+:::note[Lo que no se sincroniza]
+El audio no viaja por la sala: ni tu voz ni el sonido del recorrido (música,
+ambientes, narraciones), que cada asistente oye, o no, en su propio
+navegador. Por eso hace falta la videollamada para la voz. Tampoco se
+sincroniza lo que se hace dentro de un panel, como las respuestas de un quiz:
+cada asistente contesta por su cuenta.
+:::
+
+¿Por qué no compartir pantalla y ya? Porque así cada participante mueve su
+propia vista sincronizada: mucho menos ancho de banda, imagen nítida en lugar
+de un vídeo comprimido y la posibilidad de que cada uno se detenga en lo que le
+interese.
+
+## Consejos
+
+- Prueba la sala antes con un segundo dispositivo como asistente.
+- Si usas una sola pantalla, deja la reunión en una ventana pequeña y el enlace
+  de guía a pantalla completa.
+- Para clases, combina la visita con un
+  [quiz o un escape room](/docs/usuario/escape-room/) que el alumnado haga
+  después por su cuenta.
+
+Implementación: WebSockets sobre Durable Objects en Cloudflare o el servidor
+ws integrado en una instalación propia.

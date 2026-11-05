@@ -1,0 +1,59 @@
+[
+  {
+    "fecha": "2026-10-11",
+    "titulo": "Editar en grupo, en directo",
+    "items": [
+      "Varias personas pueden editar el mismo recorrido a la vez: cada una sale en la cabecera con sus iniciales y su color, y pulsarla lleva a la escena en la que está.",
+      "Lo que hace cada uno llega a los demás sin recargar: escenas, puntos, pasos, orden y ajustes. Si dos personas guardan a la vez, se fusiona sin perder lo que se está escribiendo.",
+      "Si alguien tiene abierto el panel de una escena o de un punto, los demás ven «Lo está editando…» y esos campos quedan en solo lectura para no pisarse, con «Editar igualmente» por si hace falta.",
+      "En el panorama se ve dónde mira y adónde apunta cada persona, con una marca de su color y su nombre.",
+      "Si se corta la conexión en directo, un aviso discreto lo dice; los cambios se siguen guardando y se vuelve a conectar sola.",
+      "Los recorridos que te comparten desde otra organización salen en Proyectos, en «Compartidos contigo», con de quién son y tu rol. Dentro ves sus miniaturas y su biblioteca y, si puedes editar, subes fotos que quedan en el recorrido."
+    ]
+  },
+  {
+    "fecha": "2026-10-11",
+    "titulo": "Realidad virtual más nítida y más completa",
+    "items": [
+      "En las gafas, las escenas se ven hasta el doble de nítidas (las fotos de 8K o más) y cargan antes: la buena resolución llega por partes, empezando por lo que tienes delante, y las escenas vecinas se descargan mientras miras, así que al saltar aparecen ya enteras.",
+      "Los PDF se leen dentro de las gafas, página a página, con anterior, siguiente y desplazamiento, tanto con los mandos como con la mirada.",
+      "Los vídeos subidos se reproducen dentro de las gafas con su botón de reproducir y pausar. Los de YouTube, Vimeo o PeerTube enseñan su título y su miniatura, y un botón para salir de la realidad virtual y verlos en el recorrido."
+    ]
+  },
+  {
+    "fecha": "2026-10-11",
+    "titulo": "Más de lo que pidió el equipo docente",
+    "items": [
+      "Junto a «Silenciar», una flecha abre el sonido de la escena: con un clic deja de sonar en el recorrido publicado sin perder los ficheros, y se vuelve a activar igual. En «Audio de la escena» está el mismo interruptor y un botón «Quitar» para el ambiente y para la narración.",
+      "El hotspot «Acción (variables)» se explica con un ejemplo, la llave y la puerta, y al añadirlo ya trae ese cambio puesto. La descripción aclara que no es un tesoro ni una pregunta.",
+      "El plano del visor se puede ampliar casi a toda la pantalla, sus puntos se aciertan mejor con el dedo y, con «Plano abierto al empezar» en los ajustes del tour, sale como minimapa desde el principio.",
+      "Exportar en ZIP ya no se queda parado en la recta final: una descarga que deja de recibir datos se corta y se reintenta, y los paquetes de más de 4 GB o de más de 65 535 ficheros salen enteros.",
+      "El plano del recorrido, en el visor: el botón del mapa de abajo a la izquierda (o la tecla M) lo muestra y lo oculta, y ya no queda tapado por el propio plano. El panel tiene un aspa para cerrarlo y una casilla «Mostrar puntos» para ver el plano limpio. En el editor, una escena sin colocar se pone pulsándola y después su sitio en el plano, y la imagen que subes desde «Añadir plano» queda puesta sin tener que buscarla."
+    ]
+  },
+  {
+    "fecha": "2026-10-02",
+    "titulo": "Lo que pidió el equipo docente",
+    "items": [
+      "Exportar en ZIP ya no se corta: si un fichero falla, lo reintenta, y si aun así no llega, el ZIP se genera igual y lo apunta en LEEME.md. También va más rápido.",
+      "Exportar y Compartir explican qué opción elegir, con un enlace a la guía de Moodle.",
+      "«Usar vista actual» fija de verdad la vista de inicio: al recargar el recorrido ya no manda la posición guardada en la dirección del navegador.",
+      "Los pasos nuevos llegan a la vista por defecto de la escena de destino, y el panel de llegadas dice qué vista usa cada uno.",
+      "En realidad virtual se llega mirando hacia donde toca, las compuertas de quiz, formulario y tesoro también bloquean el paso, y en Android la mirada fija activa los hotspots aunque el móvil se mueva un poco.",
+      "Un mismo quiz puede tener varias preguntas: se responden de una en una, con un resumen al final, nota mínima opcional y la nota completa en SCORM y LTI. Si los intentos son limitados y se agotan, la compuerta deja pasar y la pregunta cuenta como fallada.",
+      "Las secciones de propiedades salen plegadas y recuerdan cómo las dejaste.",
+      "Botón «Silenciar» a la vista en las escenas con sonido.",
+      "Botón «Plano del recorrido» en la lista de escenas, con los pasos para crear el plano con puntos que llevan a cada escena.",
+      "Al cambiar el nombre de una escena, también desde el grafo, se ofrece cambiar el de su foto.",
+      "Nueva sección «Equipo» en la barra lateral y botón «Personas» en el editor para compartir un recorrido. El trabajo en equipo está en todos los planes.",
+      "En Ajustes del recorrido: música para todo el recorrido (calla cuando una escena tiene su propio sonido), logotipo, marca de agua y parche del nadir propios, y texto de la insignia.",
+      "El hotspot «Contador / estado» ahora se llama «Acción (variables)», resume lo que hace y tiene un editor de condiciones sin JSON.",
+      "Enlaces «¿Cómo se hace?» a la documentación en quiz, tesoro, acción, polígono y formulario.",
+      "Las etiquetas largas se leen enteras al tocarlas, también en el móvil.",
+      "En la visita guiada, cuando el guía abre un texto, una imagen o un quiz, se abre también a quien le sigue.",
+      "Plantillas nuevas en el grupo Educación: «Quiz evaluable: los árboles y las estaciones» y «Búsqueda del tesoro: máquinas y oficios».",
+      "Aviso de «Cambios sin publicar» junto al botón Publicar, y el Studio se actualiza solo cuando hay una versión nueva.",
+      "Este panel de novedades, el botón «Informar de un problema» y el número de versión en la barra lateral."
+    ]
+  }
+]

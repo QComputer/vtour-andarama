@@ -1,0 +1,346 @@
+@import "@andarama/ui/theme.css";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Baloo 2 (variable): la voz redonda de Andarama. Space Mono: el susurro de
+   datos. Ambas bajo Open Font License. */
+@font-face {
+  font-family: "Baloo 2";
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("/studio/fonts/Baloo2-Variable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Space Mono";
+  font-weight: 400;
+  font-display: swap;
+  src: url("/studio/fonts/SpaceMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Space Mono";
+  font-weight: 700;
+  font-display: swap;
+  src: url("/studio/fonts/SpaceMono-Bold.woff2") format("woff2");
+}
+
+/* Baloo 2 se sirve en un subconjunto latino (Latin-1): para los alfabetos
+   que no cubre (Latin Extended-A, griego, cirílico, árabe, hebreo, tailandés,
+   chino, japonés, coreano, vietnamita) la interfaz usa la fuente del sistema
+   entera, en vez de mezclar dos voces glifo a glifo. Misma lista que
+   SYSTEM_FONT_LANGS en src/i18n.ts. */
+html:lang(ar), html:lang(cs), html:lang(el), html:lang(he), html:lang(hr), html:lang(hu),
+html:lang(ja), html:lang(ko), html:lang(pl), html:lang(ro), html:lang(ru), html:lang(sk),
+html:lang(th), html:lang(tr), html:lang(uk), html:lang(vi), html:lang(zh) {
+  --anda-font: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--anda-bg);
+  color: var(--anda-text);
+  font-family: var(--anda-font);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Grano de papel, como en la landing: la huella del proceso */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix values='0 0 0 0 0.2 0 0 0 0 0.15 0 0 0 0 0.06 0 0 0 0.04 0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23g)'/%3E%3C/svg%3E");
+}
+.dark body {
+  background-image: none;
+}
+
+::selection {
+  background: rgba(255, 179, 0, 0.35);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--anda-border) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--anda-border);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Entradas suaves para vistas del Studio */
+@keyframes anda-fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.anda-enter {
+  animation: anda-fade-up 0.25s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+/* La criatura: el brinco blando de la landing, reutilizable en el Studio */
+@keyframes anda-brinco {
+  from { transform: scaleY(0.96) scaleX(1.02); }
+  to { transform: scaleY(1.04) scaleX(0.98) translateY(-5px); }
+}
+.anda-brinca {
+  animation: anda-brinco 0.55s ease-in-out infinite alternate;
+  transform-origin: 50% 100%;
+}
+/* Y el paseo: cruza su contenedor sobre una línea de suelo */
+@keyframes anda-pasear {
+  from { transform: translateX(-70px); }
+  to { transform: translateX(calc(100% + 70px)); }
+}
+.anda-paseo { position: relative; overflow: hidden; }
+.anda-paseo__suelo {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 8px;
+  border-bottom: 2.5px solid currentColor;
+  opacity: 0.75;
+}
+/* El desplazamiento y el brinco van en elementos distintos: dos animaciones
+   de transform sobre el mismo elemento se pisan en vez de sumarse */
+.anda-paseo__anda {
+  position: absolute;
+  bottom: 8px;
+  left: 0;
+  animation: anda-pasear 14s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .anda-enter { animation: none; }
+  .anda-brinca, .anda-paseo__anda { animation: none; }
+  .anda-paseo__anda { left: 62%; }
+}
+
+/* ---------------------------------------------------------------------------
+ * Relieve: el lenguaje visual del Studio.
+ *
+ * El mismo gesto del botón principal —degradado vertical suave, filo de luz
+ * arriba y sombra corta— aplicado a todo lo que se puede pulsar o contiene
+ * algo. Es un relieve de tecla, no una pegatina recortada: la marca gritona
+ * se queda para la portada y el acceso, que es donde toca gritar.
+ * ------------------------------------------------------------------------- */
+/* Cabecera de sección: una banda con relieve, no un cartel */
+.anda-cabecera {
+  border: 1px solid var(--anda-border);
+  border-radius: 16px;
+  background: linear-gradient(180deg, var(--anda-surface) 0%, var(--anda-primary-soft) 100%);
+  box-shadow: var(--anda-relieve);
+}
+
+/* Tarjetas */
+.anda-tarjeta {
+  border: 1px solid var(--anda-border);
+  border-radius: 16px;
+  background: linear-gradient(180deg, var(--anda-surface) 0%, var(--anda-surface-2) 100%);
+  box-shadow: var(--anda-relieve);
+  transition: transform 0.18s cubic-bezier(0.2, 0.9, 0.3, 1.2), box-shadow 0.18s ease, border-color 0.18s ease;
+}
+.anda-tarjeta:hover {
+  transform: translateY(-3px);
+  border-color: var(--anda-primary-light);
+  box-shadow: var(--anda-relieve-alto);
+}
+.anda-tarjeta:has(:focus-visible) { box-shadow: var(--anda-relieve-alto); border-color: var(--anda-primary); }
+.anda-tarjeta--carpeta { border-style: dashed; }
+.anda-tarjeta--carpeta:hover, .anda-tarjeta--soltando { border-style: solid; border-color: var(--anda-primary); }
+.anda-tarjeta--soltando {
+  transform: translateY(-3px);
+  background: linear-gradient(180deg, var(--anda-primary-soft) 0%, var(--anda-surface-2) 100%);
+  box-shadow: var(--anda-relieve-alto);
+}
+
+/* La portada respira al pasar por encima */
+.anda-portada img, .anda-portada span[data-fondo] { transition: transform 0.35s cubic-bezier(0.2, 0.9, 0.3, 1); }
+.anda-tarjeta:hover .anda-portada img, .anda-tarjeta:hover .anda-portada span[data-fondo] { transform: scale(1.05); }
+
+/* Navegación lateral: el activo es la misma tecla ámbar del botón principal */
+.anda-nav {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 12px;
+  padding: 9px 12px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--anda-text-dim);
+  transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+.anda-nav:hover { background: var(--anda-surface-2); color: var(--anda-text); }
+.anda-nav.active {
+  background: linear-gradient(180deg, var(--anda-primary-light) 0%, var(--anda-primary) 100%);
+  color: #33260f;
+  box-shadow: var(--anda-relieve);
+}
+.anda-nav__icono { display: flex; flex: 0 0 auto; }
+
+/* Buscador: hueco con luz arriba, no un campo de formulario cualquiera */
+.anda-buscador { position: relative; display: flex; align-items: center; }
+.anda-buscador svg { position: absolute; left: 13px; height: 16px; width: 16px; color: var(--anda-text-dim); pointer-events: none; }
+.anda-buscador input {
+  width: 100%;
+  border: 1px solid var(--anda-border);
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--anda-surface-2) 0%, var(--anda-surface) 100%);
+  padding: 9px 16px 9px 38px;
+  font-size: 14px;
+  color: var(--anda-text);
+  box-shadow: inset 0 1px 2px rgba(72, 52, 8, 0.08);
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.anda-buscador input::placeholder { color: var(--anda-text-dim); }
+.anda-buscador input:focus {
+  outline: none;
+  border-color: var(--anda-primary);
+  box-shadow: inset 0 1px 2px rgba(72, 52, 8, 0.08), var(--anda-ring);
+}
+
+/* Segmentado: el elegido sube, los demás quedan hundidos */
+.anda-seg {
+  display: flex;
+  gap: 3px;
+  border: 1px solid var(--anda-border);
+  border-radius: 999px;
+  padding: 3px;
+  background: linear-gradient(180deg, var(--anda-surface-2) 0%, var(--anda-surface) 100%);
+  box-shadow: inset 0 1px 2px rgba(72, 52, 8, 0.07);
+}
+.anda-seg button {
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--anda-text-dim);
+  transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+.anda-seg button:hover { color: var(--anda-text); }
+.anda-seg button[aria-pressed="true"] {
+  background: linear-gradient(180deg, var(--anda-primary-light) 0%, var(--anda-primary) 100%);
+  color: #33260f;
+  box-shadow: var(--anda-relieve);
+}
+
+/* Barra de herramientas del editor: superficie con filo de luz, no una franja
+   plana. Es el borde superior de todo lo que hay debajo. */
+.anda-barra {
+  border-bottom: 1px solid var(--anda-border);
+  background: linear-gradient(180deg, var(--anda-surface) 0%, var(--anda-surface-2) 100%);
+  box-shadow: var(--anda-luz);
+}
+
+/* Pestañas del editor: el mismo raíl hundido del segmentado, en horizontal y
+   con sitio para el icono. La pestaña activa es la tecla ámbar. */
+.anda-pestanas {
+  display: flex;
+  gap: 3px;
+  border: 1px solid var(--anda-border);
+  border-radius: 999px;
+  padding: 3px;
+  background: linear-gradient(180deg, var(--anda-surface-2) 0%, var(--anda-surface) 100%);
+  box-shadow: var(--anda-hundido);
+}
+.anda-pestanas button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--anda-text-dim);
+  transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+.anda-pestanas button:hover { color: var(--anda-text); }
+.anda-pestanas button[aria-pressed="true"] {
+  background: var(--anda-tecla);
+  color: #33260f;
+  box-shadow: var(--anda-relieve);
+}
+
+/* Bloque: la caja de contenido que no se pulsa (secciones de ajustes, fichas
+   de administración). Mismo relieve que la tarjeta, pero quieto. */
+.anda-bloque {
+  border: 1px solid var(--anda-border);
+  border-radius: 16px;
+  background: linear-gradient(180deg, var(--anda-surface) 0%, var(--anda-surface-2) 100%);
+  box-shadow: var(--anda-relieve);
+}
+
+/* Panel hundido: listas y bandejas donde se deja caer contenido */
+.anda-hueco {
+  border: 1px solid var(--anda-border);
+  border-radius: 14px;
+  background: linear-gradient(180deg, var(--anda-surface-2) 0%, var(--anda-surface) 100%);
+  box-shadow: var(--anda-hundido);
+}
+
+/* Ficha de lista (escenas, medios del muelle): relieve corto que sube al pasar */
+.anda-ficha {
+  border: 1px solid var(--anda-border);
+  border-radius: 12px;
+  background: linear-gradient(180deg, var(--anda-surface) 0%, var(--anda-surface-2) 100%);
+  box-shadow: var(--anda-relieve);
+  transition: transform 0.15s cubic-bezier(0.2, 0.9, 0.3, 1.2), box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.anda-ficha:hover { transform: translateY(-2px); box-shadow: var(--anda-relieve-alto); border-color: var(--anda-primary-light); }
+.anda-ficha--activa {
+  border-color: var(--anda-primary);
+  background: linear-gradient(180deg, var(--anda-primary-soft) 0%, var(--anda-surface-2) 100%);
+  box-shadow: var(--anda-relieve-alto);
+}
+
+/* ---------------------------------------------------------------------------
+ * El cameo: cada tanto la criatura cruza el editor por abajo y se va. No
+ * interrumpe nada —no recibe clics, no la lee el lector de pantalla— y no
+ * aparece si el sistema pide menos movimiento. Es solo un guiño.
+ * ------------------------------------------------------------------------- */
+@keyframes anda-cameo {
+  from { transform: translateX(-96px); }
+  to { transform: translateX(calc(100vw + 96px)); }
+}
+@keyframes anda-cameo-vuelta {
+  from { transform: translateX(calc(100vw + 96px)); }
+  to { transform: translateX(-96px); }
+}
+.anda-cameo {
+  position: fixed;
+  bottom: 14px;
+  left: 0;
+  z-index: 20;
+  pointer-events: none;
+  animation: anda-cameo var(--anda-cameo-dur, 15s) linear forwards;
+}
+/* A veces vuelve por donde vino */
+.anda-cameo--vuelta { animation-name: anda-cameo-vuelta; }
+
+@media (prefers-reduced-motion: reduce) {
+  .anda-tarjeta, .anda-nav, .anda-buscador input, .anda-portada img, .anda-portada span[data-fondo] { transition: none; }
+  .anda-ficha { transition: none; }
+  .anda-ficha:hover { transform: none; }
+  .anda-cameo { display: none; }
+  .anda-tarjeta:hover { transform: none; }
+}
+
+/* Vista previa del Markdown de los paneles de texto (mismo aire que el visor) */
+.anda-md-preview { line-height: 1.6; }
+.anda-md-preview h2 { font-size: 1.25em; margin: .2em 0 .5em; font-weight: 700; }
+.anda-md-preview h3 { font-size: 1.1em; margin: .6em 0 .4em; font-weight: 700; }
+.anda-md-preview p { margin: 0 0 .7em; }
+.anda-md-preview ul, .anda-md-preview ol { padding-left: 1.4em; margin: 0 0 .7em; }
+.anda-md-preview a { color: var(--anda-primary); text-decoration: underline; }
+.anda-md-preview blockquote { border-left: 3px solid var(--anda-primary); margin: .6em 0; padding: .1em 0 .1em .9em; color: var(--anda-text-dim); }
+.anda-md-preview code { background: var(--anda-surface); padding: 1px 5px; border-radius: 5px; font-size: .9em; }
+.anda-md-preview table { border-collapse: collapse; width: 100%; margin: 0 0 .7em; }
+.anda-md-preview td, .anda-md-preview th { border: 1px solid var(--anda-border); padding: 4px 8px; text-align: left; }

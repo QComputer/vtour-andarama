@@ -1,0 +1,99 @@
+/*
+ * Tokens del tema Andarama: amarillo LocoRoco y naranja sobre papel hueso.
+ *
+ * La regla es de la estética Saorín: la intensidad —el amarillo que canta—
+ * necesita un sustrato cálido que la haga legible, así que el fondo nunca es
+ * blanco puro ni el texto negro puro. Tipografía: Baloo 2 (la voz redonda de
+ * la marca) y Space Mono para el susurro de datos.
+ */
+:root {
+  --anda-primary: #f59e00;
+  --anda-primary-dark: #d97c00;
+  --anda-primary-light: #ffc233;
+  --anda-primary-soft: #fdefd2;
+  /* El naranja de la marca no llega a 4,5:1 sobre papel: para texto e iconos
+     sueltos se usa esta tinta, más tostada (5,5:1 sobre la superficie). */
+  --anda-primary-ink: #9a5800;
+  --anda-accent: #ff6b1a;
+  --anda-yellow: #ffd900;
+  --anda-grad: linear-gradient(135deg, #ffd900 0%, #ffb300 55%, #ff8a00 100%);
+  --anda-grad-deep: linear-gradient(160deg, #6b3400 0%, #a84e00 55%, #d97c00 100%);
+  --anda-bg: #f7f2e7;
+  --anda-surface: #fffdf7;
+  --anda-surface-2: #f5edda;
+  --anda-border: #e8ddc4;
+  --anda-text: #33260f;
+  --anda-text-dim: #72643e;
+  --anda-danger: #c73e2d;
+  --anda-ok: #3d8b40;
+  --anda-radius: 12px;
+  --anda-font: "Baloo 2", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --anda-mono: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --anda-shadow: 0 1px 2px rgba(72, 52, 8, 0.06), 0 4px 14px rgba(72, 52, 8, 0.07);
+  --anda-shadow-lg: 0 2px 6px rgba(72, 52, 8, 0.08), 0 18px 44px rgba(72, 52, 8, 0.14);
+  --anda-ring: 0 0 0 3px rgba(245, 158, 0, 0.28);
+  /* Relieve: el filo de luz arriba y la sombra corta debajo. Es la gramática
+     de todo lo que se pulsa, se escribe o contiene algo. */
+  --anda-luz: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  --anda-hundido: inset 0 1px 2px rgba(72, 52, 8, 0.08);
+  --anda-relieve: var(--anda-luz), 0 1px 2px rgba(72, 52, 8, 0.1), 0 2px 8px rgba(72, 52, 8, 0.06);
+  --anda-relieve-alto: var(--anda-luz), 0 2px 4px rgba(72, 52, 8, 0.12), 0 10px 24px rgba(72, 52, 8, 0.14);
+  --anda-tecla: linear-gradient(180deg, var(--anda-primary-light) 0%, var(--anda-primary) 100%);
+}
+
+.dark {
+  --anda-primary: #ffb300;
+  --anda-primary-dark: #e69500;
+  --anda-primary-light: #ffcf4d;
+  --anda-primary-soft: #4a3608;
+  --anda-primary-ink: #ffb300;
+  --anda-bg: #201808;
+  --anda-surface: #2b2110;
+  --anda-surface-2: #382c15;
+  --anda-border: #4d3d1d;
+  --anda-text: #f7efdd;
+  --anda-text-dim: #bda87a;
+  --anda-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.3);
+  --anda-shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.45), 0 18px 44px rgba(0, 0, 0, 0.4);
+  --anda-luz: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  --anda-hundido: inset 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+/* ---------------------------------------------------------------------------
+ * Animaciones del Studio. Poquitas y con intención: los diálogos brotan, los
+ * avisos suben desde abajo, y todo se apaga si el sistema pide menos
+ * movimiento.
+ * ------------------------------------------------------------------------- */
+@keyframes anda-anim-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes anda-anim-pop {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+@keyframes anda-anim-sube {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+.anda-anim-overlay { animation: anda-anim-fade 0.18s ease-out; }
+.anda-anim-dialog { animation: anda-anim-pop 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.15); }
+.anda-anim-toast { animation: anda-anim-sube 0.22s cubic-bezier(0.2, 0.9, 0.3, 1); }
+@media (prefers-reduced-motion: reduce) {
+  .anda-anim-overlay, .anda-anim-dialog, .anda-anim-toast { animation: none; }
+}
+
+/* Enlace «Saltar al contenido»: fuera de la vista hasta que el teclado llega a él. */
+.anda-salto {
+  position: absolute;
+  left: 12px;
+  top: -48px;
+  z-index: 100;
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: var(--anda-surface);
+  color: var(--anda-text);
+  font-weight: 600;
+  box-shadow: var(--anda-shadow-lg);
+}
+.anda-salto:focus { top: 12px; outline: 2px solid var(--anda-primary-ink); outline-offset: 2px; }

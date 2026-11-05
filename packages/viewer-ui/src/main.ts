@@ -1,0 +1,110 @@
+import { mountViewer } from "./skin.js";
+import type { Tour } from "@andarama/schema";
+import { parseDeepLink } from "@andarama/viewer";
+import { ensureUiLang } from "./i18n.js";
+import { baseFromTourUrl } from "./url.js";
+import { launchParams } from "./quiz-result.js";
+
+/**
+ * Punto de entrada del bundle standalone: paginas de tour publicadas
+ * (/t/{slug}) y paquetes exportados. Lee la configuracion de
+ * window.Andarama_CONFIG o de atributos data-* del contenedor #andarama.
+ */
+
+interface StandaloneConfig {
+  tourUrl?: string;
+  tour?: Tour;
+  baseUrl?: string;
+  analyticsEndpoint?: string | null;
+  formEndpoint?: string | null;
+  /** Resultado del quiz: solo en el tour servido por la plataforma. */
+  quizEndpoint?: string | null;
+  turnstileSiteKey?: string | null;
+  kiosk?: boolean;
+  liveUrl?: string;
+  liveRole?: "guide" | "attendee";
+  liveKey?: string;
+  liveName?: string;
+  /** Insignia «Hecho con Andarama» (instancia alojada, planes sin marca blanca). */
+  badge?: { url: string };
+}
+
+declare global {
+  interface Window {
+    Andarama_CONFIG?: StandaloneConfig;
+    Andarama?: { mount: typeof mountViewer; version: string; instance?: ReturnType<typeof mountViewer> };
+  }
+}
+
+/** «<versión>+<sha corto> · <fecha>», inyectada por bundle.mjs (esbuild `define`). */
+declare const __ANDARAMA_VERSION__: string | undefined;
+const VERSION = typeof __ANDARAMA_VERSION__ === "string" ? __ANDARAMA_VERSION__ : "dev";
+
+// La versión no se ve en el visor: queda en window.Andarama.version y en el
+// atributo data-version del contenedor, para quien informa de un problema.
+window.Andarama = { mount: mountViewer, version: VERSION };
+
+
+async function boot(): Promise<void> {
+  const container = document.getElementById("andarama");
+  if (container == null) return;
+  container.dataset.version = VERSION;
+  const cfg: StandaloneConfig = window.Andarama_CONFIG ?? {};
+  const tourUrl = cfg.tourUrl ?? container.dataset.tour;
+  let tour = cfg.tour;
+  if (tour == null && tourUrl != null) {
+    const res = await fetch(tourUrl);
+    if (!res.ok) {
+      container.textContent = `Error ${res.status} cargando el tour`;
+      return;
+    }
+    tour = (await res.json()) as Tour;
+  }
+  if (tour == null) {
+    container.textContent = "Sin configuración de tour";
+    return;
+  }
+  const params = new URLSearchParams(location.search);
+  const liveRoom = params.get("live");
+  // El cromo habla el idioma del tour (o el que pida el enlace, si el tour lo
+  // tiene); si no hay diccionario para él, el del navegador. Se pide antes de
+  // montar para que la interfaz no parpadee en inglés.
+  const linkLang = parseDeepLink(location.href).lang;
+  await ensureUiLang(linkLang != null && tour.meta.langs.includes(linkLang) ? linkLang : tour.meta.defaultLang);
+  // Lanzamiento desde un LMS: /api/v1/lti/launch redirige con ?lti= y ?name=
+  const lanzamiento = launchParams(location.search);
+  // La instancia queda accesible en window.Andarama.instance: los integradores
+  // (y las pruebas) pueden pilotar el visor ya montado sin volver a montarlo.
+  window.Andarama!.instance = mountViewer({
+    container,
+    tour,
+    baseUrl: cfg.baseUrl ?? container.dataset.base ?? baseFromTourUrl(tourUrl),
+    analyticsEndpoint: cfg.analyticsEndpoint,
+    formEndpoint: cfg.formEndpoint,
+    quizEndpoint: cfg.quizEndpoint ?? null,
+    ltiLaunchId: lanzamiento.ltiLaunchId,
+    participantName: lanzamiento.participantName,
+    turnstileSiteKey: cfg.turnstileSiteKey,
+    // ?kiosk=1 lo enciende y ?kiosk=0 lo apaga aunque el paquete venga en
+    // quiosco: una misma dirección sirve para la pantalla y para la persona.
+    kiosk: params.get("kiosk") === "0" ? false : cfg.kiosk === true || params.get("kiosk") === "1",
+    badge: cfg.badge,
+    live:
+      cfg.liveUrl != null || liveRoom != null
+        ? {
+            url:
+              cfg.liveUrl ??
+              `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/rt/live/${liveRoom}`,
+            role: cfg.liveRole ?? (params.get("guide") != null ? "guide" : "attendee"),
+            guideKey: cfg.liveKey ?? params.get("guide") ?? undefined,
+            name: cfg.liveName ?? params.get("name") ?? undefined,
+          }
+        : undefined,
+  });
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => void boot());
+} else {
+  void boot();
+}

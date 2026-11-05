@@ -1,0 +1,298 @@
+import { create } from "zustand";
+import { normalizeUiLang } from "@andarama/schema";
+import { api } from "./api";
+import { getClerk } from "./clerk";
+import { useI18nStore } from "./i18n";
+import { onMeLoaded } from "./growth";
+
+/** Sesion y organizacion activa. */
+
+/** Preferencias personales guardadas en la cuenta (PUT /me/prefs). */
+export interface UserPrefs {
+  /** Idioma de la interfaz del Studio. */
+  editorLang?: string;
+  /** Idioma por defecto de los tours que crea. */
+  defaultLang?: string;
+  /** Modo de entrada preferido al crear pasos de navegación. */
+  entryMode?: string;
+  /** Fecha (AAAA-MM-DD) de la última entrada de «Novedades» que ha visto. */
+  novedadesVistas?: string;
+}
+
+/** Capacidades que un plan enciende en la instancia alojada (misma lista que la API). */
+export type PlanCapability = "classroom" | "scorm" | "lti" | "whiteLabel" | "customDomain" | "team" | "invoice";
+
+export interface Me {
+  user: {
+    id: string;
+    email: string;
+    name: string;
+    roleGlobal: string;
+    emailVerified: boolean;
+    totpEnabled: boolean;
+    ssoLinked: boolean;
+    clerkLinked?: boolean;
+    prefs?: UserPrefs;
+    createdAt?: number;
+  } | null;
+  orgs: { id: string; name: string; slug: string; role: string; ownerId?: string | null }[];
+  /** Plan en la instancia alojada; en el self-host, mode "local". */
+  billing?: {
+    mode: "clerk" | "local";
+    plan: string | null;
+    planName: string | null;
+    planFromClerk?: string | null;
+    /** null en el self-host: allí todo está permitido. */
+    capabilities?: PlanCapability[] | null;
+    trialEndsAt?: number | null;
+    attributionPending?: boolean;
+  };
+}
+
+/** ¿Puede este usuario usar la capacidad? En el self-host, siempre. */
+export function canUse(me: Me | null, capability: PlanCapability): boolean {
+  const caps = me?.billing?.capabilities;
+  if (me?.billing?.mode !== "clerk" || caps == null) return true;
+  // Quien administra la instancia no tiene límites de plan
+  if (me.user?.roleGlobal === "admin") return true;
+  return caps.includes(capability);
+}
+
+interface AuthState {
+  me: Me | null;
+  loaded: boolean;
+  currentOrgId: string | null;
+  /** Arranque del Studio: vuelve a preguntar quién soy sin dar por buena la respuesta anterior. */
+  bootstrap: () => Promise<void>;
+  refresh: () => Promise<void>;
+  setOrg: (orgId: string) => void;
+  logout: () => Promise<void>;
+}
+
+/**
+ * Si la persona es de la organización (o administra la instancia) y puede ver
+ * su biblioteca entera. Quien entra en un recorrido que le ha compartido otra
+ * organización no lo es: ve y sube solo lo de ese recorrido.
+ */
+export function useLibraryAccess(orgId: string): boolean {
+  return useAuth((s) => s.me?.user?.roleGlobal === "admin" || (s.me?.orgs ?? []).some((o) => o.id === orgId));
+}
+
+export const useAuth = create<AuthState>((set, get) => ({
+  me: null,
+  loaded: false,
+  currentOrgId: localStorage.getItem("andarama:org"),
+  bootstrap: async () => {
+    set({ loaded: false });
+    // Con Clerk, la cookie de lectura para lo que se carga por URL
+    if (getClerk()?.isSignedIn() === true) {
+      await api("/auth/clerk/session", { method: "POST", body: {} }).catch(() => {});
+    }
+    await get().refresh();
+  },
+  refresh: async () => {
+    try {
+      const me = await api<Me>("/me");
+      const current = get().currentOrgId;
+      const validOrg = me.orgs.find((o) => o.id === current) ?? me.orgs[0] ?? null;
+      set({ me, loaded: true, currentOrgId: validOrg?.id ?? null });
+      // El idioma guardado en la cuenta manda sobre el de este navegador:
+      // así la elección viaja de un dispositivo a otro.
+      const remoto = normalizeUiLang(me.user?.prefs?.editorLang);
+      if (remoto != null && remoto !== useI18nStore.getState().lang) void useI18nStore.getState().setLang(remoto);
+      // Instancia alojada: eventos de alta y pago, y la atribución del primer toque
+      onMeLoaded(me);
+    } catch {
+      set({ me: { user: null, orgs: [] }, loaded: true });
+    }
+  },
+  setOrg: (orgId) => {
+    localStorage.setItem("andarama:org", orgId);
+    set({ currentOrgId: orgId });
+  },
+  logout: async () => {
+    const clerk = getClerk();
+    if (clerk != null) {
+      set({ me: { user: null, orgs: [] }, currentOrgId: null });
+      // Primero la cookie de lectura, luego la sesión de Clerk
+      await api("/auth/logout", { method: "POST" }).catch(() => {});
+      await clerk.signOut();
+      return;
+    }
+    await api("/auth/logout", { method: "POST" });
+    set({ me: { user: null, orgs: [] }, currentOrgId: null });
+  },
+}));
+
+/** Guarda preferencias personales en la cuenta, conservando las que ya había. */
+export async function savePrefs(patch: Partial<UserPrefs>): Promise<void> {
+  const { me } = useAuth.getState();
+  if (me?.user == null) return;
+  const prefs: UserPrefs = { ...me.user.prefs, ...patch };
+  await api("/me/prefs", { method: "PUT", body: prefs });
+  useAuth.setState({ me: { ...me, user: { ...me.user, prefs } } });
+}
+
+/** Cambia el idioma de la interfaz y, si hay sesión, lo deja guardado en la cuenta. */
+export async function chooseUiLang(lang: string): Promise<void> {
+  await useI18nStore.getState().setLang(lang);
+  await savePrefs({ editorLang: useI18nStore.getState().lang }).catch(() => {
+    // Sin red o sin sesión: la elección queda al menos en este navegador.
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Estado del editor con deshacer/rehacer (§3.5)
+// ---------------------------------------------------------------------------
+
+export interface SceneRow {
+  id: string;
+  projectId: string;
+  sort: number;
+  title: string;
+  type: "image" | "video" | "flat";
+  mediaId: string | null;
+  sourceJson: string | null;
+  initialViewJson: string | null;
+  limitsJson: string | null;
+  audioJson: string | null;
+  mapJson: string | null;
+  metaJson: string;
+}
+
+export interface HotspotRow {
+  id: string;
+  sceneId: string;
+  type: string;
+  positionJson: string;
+  styleJson: string | null;
+  contentJson: string;
+  conditionsJson: string | null;
+  sort: number;
+}
+
+export interface EditorSnapshot {
+  scenes: SceneRow[];
+  hotspots: HotspotRow[];
+  settings: Record<string, unknown>;
+}
+
+interface EditorState {
+  projectId: string | null;
+  snapshot: EditorSnapshot | null;
+  undoStack: EditorSnapshot[];
+  redoStack: EditorSnapshot[];
+  selectedSceneId: string | null;
+  selectedHotspotId: string | null;
+  dirty: boolean;
+  saving: "idle" | "saving" | "saved" | "error";
+  load: (projectId: string, snapshot: EditorSnapshot) => void;
+  /** Aplica un cambio registrandolo en el historial de deshacer. */
+  apply: (mutate: (draft: EditorSnapshot) => void) => void;
+  undo: () => void;
+  redo: () => void;
+  select: (sceneId: string | null, hotspotId?: string | null) => void;
+  setSaving: (s: EditorState["saving"]) => void;
+  /**
+   * Marca el tour como guardado solo si `saved` sigue siendo el vigente. Si
+   * se editó mientras volaba la petición, queda sucio y devuelve false.
+   */
+  markSaved: (saved: EditorSnapshot) => boolean;
+  /**
+   * Cambios de otras personas (edición en grupo): tour fusionado, historial
+   * de deshacer reescrito sobre lo nuevo y qué escenas tocaron (para que el
+   * visor se vuelva a montar solo si hace falta). No entra en el historial:
+   * deshacer no debe deshacer lo que hizo otra persona.
+   */
+  applyRemote: (next: {
+    snapshot: EditorSnapshot;
+    undoStack: EditorSnapshot[];
+    redoStack: EditorSnapshot[];
+    dirty: boolean;
+    scenes: string[] | "all";
+  }) => void;
+  /** Último cambio llegado de fuera: contador y escenas afectadas. */
+  remote: { tick: number; scenes: string[] | "all" };
+}
+
+const clone = <T>(v: T): T => structuredClone(v);
+
+export const useEditor = create<EditorState>((set, get) => ({
+  projectId: null,
+  snapshot: null,
+  undoStack: [],
+  redoStack: [],
+  selectedSceneId: null,
+  selectedHotspotId: null,
+  dirty: false,
+  saving: "idle",
+  remote: { tick: 0, scenes: [] },
+  load: (projectId, snapshot) =>
+    set({
+      projectId,
+      snapshot,
+      undoStack: [],
+      redoStack: [],
+      selectedSceneId: snapshot.scenes[0]?.id ?? null,
+      selectedHotspotId: null,
+      dirty: false,
+      saving: "idle",
+    }),
+  apply: (mutate) => {
+    const current = get().snapshot;
+    if (current == null) return;
+    const before = clone(current);
+    const draft = clone(current);
+    mutate(draft);
+    set((s) => ({
+      snapshot: draft,
+      undoStack: [...s.undoStack.slice(-49), before],
+      redoStack: [],
+      dirty: true,
+    }));
+  },
+  undo: () => {
+    const { undoStack, snapshot } = get();
+    const prev = undoStack[undoStack.length - 1];
+    if (prev == null || snapshot == null) return;
+    set((s) => ({
+      snapshot: prev,
+      undoStack: s.undoStack.slice(0, -1),
+      redoStack: [...s.redoStack, clone(snapshot)],
+      dirty: true,
+    }));
+  },
+  redo: () => {
+    const { redoStack, snapshot } = get();
+    const next = redoStack[redoStack.length - 1];
+    if (next == null || snapshot == null) return;
+    set((s) => ({
+      snapshot: next,
+      redoStack: s.redoStack.slice(0, -1),
+      undoStack: [...s.undoStack, clone(snapshot)],
+      dirty: true,
+    }));
+  },
+  select: (sceneId, hotspotId = null) => set({ selectedSceneId: sceneId, selectedHotspotId: hotspotId ?? null }),
+  setSaving: (saving) => set({ saving }),
+  markSaved: (saved) => {
+    if (get().snapshot !== saved) return false;
+    set({ dirty: false });
+    return true;
+  },
+  applyRemote: ({ snapshot, undoStack, redoStack, dirty, scenes }) => {
+    const { selectedSceneId, selectedHotspotId, remote } = get();
+    // Si otra persona borró lo que había seleccionado, se cae a algo que exista
+    const sceneOk = selectedSceneId != null && snapshot.scenes.some((sc) => sc.id === selectedSceneId);
+    const hotspotOk = selectedHotspotId != null && snapshot.hotspots.some((h) => h.id === selectedHotspotId);
+    set({
+      snapshot,
+      undoStack,
+      redoStack,
+      dirty,
+      selectedSceneId: sceneOk ? selectedSceneId : (snapshot.scenes[0]?.id ?? null),
+      selectedHotspotId: sceneOk && hotspotOk ? selectedHotspotId : null,
+      remote: { tick: remote.tick + 1, scenes },
+    });
+  },
+}));

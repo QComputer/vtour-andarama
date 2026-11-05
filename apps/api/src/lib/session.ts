@@ -1,0 +1,139 @@
+import type { Context } from "hono";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+import { and, eq, gt } from "drizzle-orm";
+import { apiTokens, sessions, users } from "@andarama/db";
+import type { AppEnv, AuthState, Db } from "./context.js";
+import { newToken, nowMs, parseJson, sha256Hex } from "./util.js";
+import { unauthorized, forbidden } from "./errors.js";
+import { resolveClerkAuth } from "./clerk.js";
+
+const SESSION_COOKIE = "u3s";
+const CSRF_COOKIE = "u3c";
+const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
+
+export async function createSession(
+  c: Context<AppEnv>,
+  userId: string,
+  opts: { totpOk: boolean; ipHash?: string; ttlMs?: number },
+): Promise<string> {
+  const db = c.get("db");
+  const id = newToken(32);
+  const ttlMs = opts.ttlMs ?? SESSION_TTL_MS;
+  await db.insert(sessions).values({
+    id: await sha256Hex(id),
+    userId,
+    expiresAt: nowMs() + ttlMs,
+    createdAt: nowMs(),
+    ipHash: opts.ipHash,
+    userAgent: c.req.header("user-agent")?.slice(0, 200),
+    totpOk: opts.totpOk,
+  });
+  const secure = new URL(c.get("config").publicUrl).protocol === "https:";
+  setCookie(c, SESSION_COOKIE, id, {
+    httpOnly: true,
+    secure,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: ttlMs / 1000,
+  });
+  // CSRF doble token: cookie legible por JS que el Studio refleja en cabecera.
+  setCookie(c, CSRF_COOKIE, newToken(16), {
+    httpOnly: false,
+    secure,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: ttlMs / 1000,
+  });
+  return id;
+}
+
+export async function destroySession(c: Context<AppEnv>): Promise<void> {
+  const raw = getCookie(c, SESSION_COOKIE);
+  if (raw != null) {
+    await c.get("db").delete(sessions).where(eq(sessions.id, await sha256Hex(raw)));
+  }
+  deleteCookie(c, SESSION_COOKIE, { path: "/" });
+  deleteCookie(c, CSRF_COOKIE, { path: "/" });
+}
+
+/** Resuelve la autenticacion: sesion por cookie o token de API Bearer. */
+export async function resolveAuth(c: Context<AppEnv>): Promise<AuthState | null> {
+  const db = c.get("db");
+  const bearer = c.req.header("authorization");
+  if (bearer != null && bearer.startsWith("Bearer andarama_")) {
+    const token = bearer.slice("Bearer ".length);
+    const hash = await sha256Hex(token);
+    const rows = await db.select().from(apiTokens).where(eq(apiTokens.hash, hash)).limit(1);
+    const tok = rows[0];
+    if (tok == null) return null;
+    const userRows = await db.select().from(users).where(eq(users.id, tok.userId)).limit(1);
+    const user = userRows[0];
+    if (user == null) return null;
+    void db.update(apiTokens).set({ lastUsedAt: nowMs() }).where(eq(apiTokens.id, tok.id)).then(
+      () => {},
+      () => {},
+    );
+    return { user, session: null, tokenScopes: parseJson<string[]>(tok.scopesJson, []) };
+  }
+  // Instancia alojada: el token de sesion de Clerk viaja como Bearer. La
+  // cookie propia solo sirve para lo que se carga por URL y no puede llevar
+  // cabeceras (miniaturas, tiles de la vista previa, descargas, iframes):
+  // vale para GET y la acuña el propio Studio a cambio de un token de Clerk
+  // (POST /auth/clerk/session). Las mutaciones exigen siempre el Bearer.
+  const verifier = c.get("clerkVerifier");
+  if (verifier != null) {
+    if (bearer != null && bearer.startsWith("Bearer ")) {
+      return resolveClerkAuth(c, verifier, bearer.slice("Bearer ".length).trim());
+    }
+    if (c.req.method !== "GET" && c.req.method !== "HEAD") return null;
+  }
+  const raw = getCookie(c, SESSION_COOKIE);
+  if (raw == null) return null;
+  const hash = await sha256Hex(raw);
+  const rows = await db
+    .select()
+    .from(sessions)
+    .where(and(eq(sessions.id, hash), gt(sessions.expiresAt, nowMs())))
+    .limit(1);
+  const session = rows[0];
+  if (session == null) return null;
+  const userRows = await db.select().from(users).where(eq(users.id, session.userId)).limit(1);
+  const user = userRows[0];
+  if (user == null) return null;
+  return { user, session: { id: session.id, userId: session.userId, totpOk: session.totpOk }, tokenScopes: null };
+}
+
+/** CSRF de doble token para mutaciones con sesion de cookie. */
+export function checkCsrf(c: Context<AppEnv>): void {
+  const auth = c.get("auth");
+  if (auth?.session == null) return; // tokens de API no usan cookies
+  const method = c.req.method;
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
+  const cookie = getCookie(c, CSRF_COOKIE);
+  const header = c.req.header("x-csrf-token");
+  if (cookie == null || header == null || cookie !== header) {
+    throw forbidden("Token CSRF inválido");
+  }
+}
+
+export function requireAuth(c: Context<AppEnv>): AuthState {
+  const auth = c.get("auth");
+  if (auth == null) throw unauthorized();
+  // Con TOTP pendiente la sesion no sirve (salvo el endpoint de verificacion)
+  if (auth.session != null && auth.user.totpSecret != null && !auth.session.totpOk) {
+    throw unauthorized("Verificación en dos pasos pendiente");
+  }
+  return auth;
+}
+
+export function requireScope(auth: AuthState, scope: string): void {
+  if (auth.tokenScopes == null) return; // sesiones tienen todos los permisos del usuario
+  if (!auth.tokenScopes.includes(scope) && !auth.tokenScopes.includes("admin")) {
+    throw forbidden(`El token de API no tiene el scope "${scope}"`);
+  }
+}
+
+export async function purgeExpiredSessions(db: Db): Promise<void> {
+  const { lt } = await import("drizzle-orm");
+  await db.delete(sessions).where(lt(sessions.expiresAt, nowMs()));
+}

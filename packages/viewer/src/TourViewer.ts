@@ -1,0 +1,1719 @@
+import Marzipano from "marzipano";
+import type {
+  AutopilotRoute,
+  ConnectionEntry,
+  Hotspot,
+  NavigationHotspot,
+  Projection,
+  Scene,
+  Tour,
+  TransitionSpec,
+  ViewParams,
+} from "@andarama/schema";
+import {
+  DEFAULT_TRANSITION,
+  DEFAULT_VIEW,
+  migrateTour,
+  resolveL10n,
+} from "@andarama/schema";
+import type {
+  QuizStateEvent,
+  TourViewerOptions,
+  Unsubscribe,
+  ViewerEventMap,
+  ViewerEventName,
+} from "./types.js";
+import { baseLevelTileUrls, buildScene, resolveUrl, type BuiltScene } from "./engine/sources.js";
+import { AudioEngine } from "./engine/audio.js";
+import { evalConditions, VariableStore } from "./engine/state.js";
+import { buildDeepLink, parseDeepLink, replaceHash } from "./engine/deeplink.js";
+import { DeviceOrientationControlMethod } from "./engine/gyro.js";
+import { littlePlanetIntroParams, ProjectionPass, projectToScreen, type ProjectionFrameState } from "./engine/projections.js";
+import { Autopilot, normalizeAutorotate } from "./engine/autopilot.js";
+import { resolveStartView } from "./engine/startView.js";
+import { anglesToViewCoords, viewCoordsToAngles } from "./engine/flatCoords.js";
+import { VRManager, type VrEnvironment, type VrHotspot, type VrPrefetch } from "./engine/vr.js";
+import type { VrCubeSource } from "./engine/xr/panorama.js";
+import { marzipanoToVr } from "./engine/xr/math.js";
+import { switchMarzipanoScene } from "./engine/xr/transition.js";
+import { SceneMarkers } from "./hotspots/markers.js";
+import { pendingGates, type GateReason } from "./engine/gate.js";
+import { QuizTracker } from "./engine/quiz.js";
+import { AnalyticsClient } from "./analytics.js";
+
+interface LoadedScene {
+  scene: Scene;
+  built: BuiltScene;
+  marzScene: any;
+  markers: SceneMarkers;
+}
+
+/**
+ * TourViewer: orquestador del motor 360. La misma clase alimenta la vista
+ * previa del Studio, los tours publicados y los paquetes exportados.
+ */
+export class TourViewer {
+  readonly tour: Tour;
+  readonly container: HTMLElement;
+
+  private viewer: any;
+  private loaded = new Map<string, LoadedScene>();
+  private currentId: string | null = null;
+  private lang: string;
+  private listeners = new Map<ViewerEventName, Set<(payload: any) => void>>();
+  private historyStack: string[] = [];
+  private vars: VariableStore;
+  private audio: AudioEngine;
+  private projectionPass: ProjectionPass | null = null;
+  private autopilotCtl: Autopilot;
+  private gyroMethod: DeviceOrientationControlMethod | null = null;
+  private gyroEnabled = false;
+  private vr: VRManager;
+  private analytics: AnalyticsClient;
+  private reducedMotion: boolean;
+  private navBlocked = false;
+  /**
+   * Primera compuerta pendiente de la escena actual (pregunta sin acertar,
+   * formulario sin enviar o tesoro sin encontrar): nadie sale sin cumplirla.
+   */
+  private gateId: string | null = null;
+  private gateReason: GateReason | null = null;
+  /** Formularios ya enviados (en esta visita o, si son de un solo envío, antes). */
+  private formsSent = new Set<string>();
+  /** Estado del último fotograma del pase de proyección. */
+  private projectionState: ProjectionFrameState = { mode: "rectilinear", mix: 0, settled: true };
+  private videoRaf = 0;
+  private sceneEnterTime = 0;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Respuestas, nota y marcadores de quiz superados (los que abren su compuerta). */
+  private readonly quiz: QuizTracker;
+  private treasureFound = new Set<string>();
+  private fpsWindow: number[] = [];
+  private lastFrame = 0;
+  private degraded = false;
+  private basePreloaded = new Set<string>();
+  private sceneUse = new Map<string, number>();
+  /** URL solicitada dentro de VR: se abre al terminar la sesión inmersiva. */
+  private pendingExternalUrl: string | null = null;
+  /** Hotspot que se abre en el visor plano al salir de VR (vídeo de YouTube, web…). */
+  private pendingHotspotId: string | null = null;
+  private baseUrl: string;
+  private destroyed = false;
+  private idleMovementActive = false;
+
+  constructor(private options: TourViewerOptions) {
+    this.tour = migrateTour(options.tour);
+    this.quiz = new QuizTracker(this.tour);
+    this.container = options.container;
+    this.baseUrl = options.baseUrl ?? "";
+    this.reducedMotion =
+      (options.respectReducedMotion ?? true) &&
+      typeof matchMedia !== "undefined" &&
+      matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    const link = options.deepLinks !== false ? parseDeepLink(location.href) : { sceneId: null, view: null, lang: null };
+    this.lang = options.lang ?? link.lang ?? this.tour.meta.defaultLang;
+    if (!this.tour.meta.langs.includes(this.lang)) this.lang = this.tour.meta.defaultLang;
+
+    this.container.classList.add("anda-viewer");
+    if (getComputedStyle(this.container).position === "static") this.container.style.position = "relative";
+
+    this.viewer = new Marzipano.Viewer(this.container, {
+      controls: { mouseViewMode: "drag" },
+      stage: { preserveDrawingBuffer: true },
+    });
+
+    this.vars = new VariableStore(this.tour.variables);
+    this.vars.subscribe((snapshot) => {
+      this.currentMarkers()?.updateVisibility(this.currentVideoTime());
+      this.emit("varsChange", snapshot);
+    });
+
+    this.audio = new AudioEngine(this.baseUrl, resolveUrl, () => this.lang);
+    this.audio.onNarrationBlockChange = (blocked) => {
+      this.navBlocked = blocked;
+      this.emit("narrationBlock", { blocked });
+    };
+
+    // El piloto automático salta con `force`: recorre el tour por su cuenta y
+    // no debe quedarse parado ante una compuerta pensada para el visitante.
+    this.autopilotCtl = new Autopilot({
+      goToScene: async (sceneId, opts) => {
+        if (opts?.view != null) {
+          await this.goTo(sceneId, { view: opts.view as ViewParams, force: true });
+          return;
+        }
+        // Sin vista propia, se entra como entraría el visitante que pulsa el
+        // paso: por la puerta que une las dos escenas y con la orientación de
+        // llegada que el autor ajustó para ese camino. Antes se caía en la
+        // vista por defecto de la escena y el recorrido no se parecía al tour.
+        const actual = this.currentScene();
+        const paso = actual?.hotspots.find((h): h is NavigationHotspot => h.type === "navigation" && h.target === sceneId);
+        await this.goTo(sceneId, { fromHotspot: paso, entry: paso?.entry, force: true });
+      },
+      rotateBy: (deltaYaw, durationMs) => this.rotateBy(deltaYaw, durationMs),
+      openHotspotPanel: (hotspotId) => {
+        const current = this.currentScene();
+        const hs = current?.hotspots.find((h) => h.id === hotspotId);
+        if (hs != null && current != null) {
+          this.emit("hotspotActivate", {
+            hotspot: hs,
+            scene: current,
+            element: this.currentMarkers()?.elementFor(hotspotId) ?? null,
+          });
+        }
+      },
+      closePanels: () => this.emit("hotspotDeactivate", {}),
+      currentSceneId: () => this.currentId,
+      doorYawTo: (sceneId) => {
+        const escena = this.currentScene();
+        const paso = escena?.hotspots.find((h) => h.type === "navigation" && h.target === sceneId);
+        return paso?.yaw ?? null;
+      },
+      turnTo: (yaw, durationMs) => this.turnTo(yaw, durationMs),
+    });
+    this.autopilotCtl.onChange = (active, routeId, reason) => this.emit("autopilotChange", { active, routeId, reason });
+
+    this.vr = new VRManager(this.container, {
+      getEnvironment: () => this.buildVrEnvironment(),
+      getHotspots: () => this.vrHotspots(),
+      onNavigate: async (target, hotspot) => {
+        // Dentro de las gafas no se espera a la transición de Marzipano: va
+        // con el requestAnimationFrame de la ventana, que Meta Quest suspende
+        // durante la sesión inmersiva, y la promesa no se resolvía nunca. El
+        // fundido lo pone el propio modo VR.
+        // Con el hotspot pulsado, la escena destino aplica la vista de llegada
+        // del paso (sin él se caía en la vista inicial de la panorámica).
+        // `force` salta los bloqueos de goTo: las compuertas ya las ha
+        // comprobado el modo VR con `navigationBlock` antes de pedir el salto.
+        const paso = hotspot?.type === "navigation" ? (hotspot as NavigationHotspot) : undefined;
+        await this.goTo(target, {
+          fromHotspot: paso,
+          entry: paso?.entry,
+          force: true,
+          transition: { kind: "cut" },
+          awaitRender: false,
+        });
+      },
+      navigationBlock: () => {
+        if (this.gateId == null) return null;
+        const reason = this.gateReason ?? "quiz";
+        const key = reason === "form" ? "form_gate_scene" : reason === "treasure" ? "treasure_gate_scene" : "quiz_gate_scene";
+        return { message: this.options.translate?.(key) ?? key, hotspotId: this.gateId, reason };
+      },
+      onDirectAction: (hs) => {
+        // Enlace, estado y polígono se resuelven con la lógica normal del
+        // visor; el enlace se difiere a la salida de VR (abrir una pestaña
+        // durante la sesión inmersiva no es visible para el usuario).
+        if (hs.type === "link") {
+          const link = hs.hotspot as { url: string; scheme?: string };
+          const url = link.scheme === "tel" ? `tel:${link.url}` : link.scheme === "mailto" ? `mailto:${link.url}` : link.url;
+          this.pendingExternalUrl = url;
+          return;
+        }
+        this.activateHotspot(hs.hotspot, null);
+      },
+      onQuizAnswer: (hotspotId, correct, points, selected, questionId) => this.reportQuizAnswer(hotspotId, correct, points, selected, questionId),
+      onExternalRequest: (url) => {
+        this.pendingExternalUrl = url;
+      },
+      onOpenAfterExit: (hotspotId) => {
+        this.pendingHotspotId = hotspotId;
+      },
+      getPrefetch: () => this.vrPrefetch(),
+      loadPdf: this.options.loadPdf,
+      onExit: () => {
+        // Al salir de VR se abre el contenido que quedó pendiente: el hotspot
+        // en su panel de siempre (sin ventanas emergentes, que el navegador
+        // bloquea fuera de un gesto) o, si no, la dirección en otra pestaña.
+        const hotspotId = this.pendingHotspotId;
+        this.pendingHotspotId = null;
+        const hotspot = hotspotId != null ? this.currentScene()?.hotspots.find((h) => h.id === hotspotId) : undefined;
+        if (hotspot != null) {
+          this.pendingExternalUrl = null;
+          this.activateHotspot(hotspot, this.currentMarkers()?.elementFor(hotspot.id) ?? null);
+          return;
+        }
+        const url = this.pendingExternalUrl;
+        this.pendingExternalUrl = null;
+        if (url != null) window.open(url, "_blank", "noopener");
+      },
+      // Marzipano mide el pitch hacia abajo y el modo VR hacia arriba
+      getViewYawPitch: () => marzipanoToVr(this.view()),
+      text: (value) => this.text(value as never),
+      url: (value) => resolveUrl(this.baseUrl, value),
+      t: (key, params) => this.options.translate?.(key, params) ?? key,
+    });
+    // Permanencia de la mirada configurable por tour
+    this.vr.dwellMs = Math.max(800, Math.round((this.tour.vr?.dwellSeconds ?? 1.5) * 1000));
+    this.vr.onChange = (active, mode) => {
+      this.emit("vrChange", { active, mode });
+      if (active) this.analytics.track({ event: "vr", sceneId: this.currentId ?? undefined });
+    };
+
+    const slug = (this.tour as { meta: { title: unknown } }).meta != null ? this.slugForAnalytics() : "tour";
+    this.analytics = new AnalyticsClient(
+      this.options.editMode === true ? null : (this.options.analyticsEndpoint ?? null),
+      slug,
+      () => this.lang,
+      this.options.onAnalytics,
+    );
+
+    if (this.supportsProjections()) {
+      this.projectionPass = new ProjectionPass(this.container, {
+        getView: () => (this.currentId != null ? this.view() : null),
+        getEnvironment: async () => {
+          try {
+            const env = await this.buildProjectionEnvironment();
+            return { element: env.element, dynamic: env.dynamic };
+          } catch {
+            return null;
+          }
+        },
+        onFrame: (state) => this.syncProjectionMarkers(state),
+      });
+    }
+
+    this.setupInteractionListeners();
+    this.setupDeepLinks();
+    this.startFpsMonitor();
+
+    const startScene = link.sceneId ?? this.tour.start.scene;
+    // La vista inicial de la escena («Usar vista actual») entra en juego si ni
+    // el enlace ni el tour fijan otra: antes se caía en DEFAULT_VIEW.
+    const startView = resolveStartView(this.tour, link);
+    void this.bootstrap(startScene, startView, link.sceneId == null);
+  }
+
+  private slugForAnalytics(): string {
+    try {
+      const m = /\/t\/([^/?#]+)/.exec(location.pathname);
+      if (m != null) return m[1]!;
+    } catch {
+      // sin location (tests)
+    }
+    return "export";
+  }
+
+  private async bootstrap(sceneId: string, view: ViewParams, allowIntro: boolean): Promise<void> {
+    const useIntro = allowIntro && !this.reducedMotion && this.tour.start.intro === "littlePlanet";
+    await this.goTo(sceneId, {
+      view: useIntro ? (littlePlanetIntroParams() as ViewParams) : view,
+      transition: { kind: "cut" },
+      force: true,
+      skipHistory: true,
+    });
+    this.analytics.track({ event: "view" });
+    this.startHeartbeat();
+    if (useIntro) {
+      const target = view;
+      window.setTimeout(() => {
+        this.lookTo(target, 2400);
+      }, 350);
+    }
+    this.emit("ready", { scene: this.currentScene()! });
+    this.applyIdleBehaviors();
+  }
+
+  // -----------------------------------------------------------------------
+  // Eventos
+  // -----------------------------------------------------------------------
+
+  on<K extends ViewerEventName>(name: K, fn: (payload: ViewerEventMap[K]) => void): Unsubscribe {
+    let set = this.listeners.get(name);
+    if (set == null) {
+      set = new Set();
+      this.listeners.set(name, set);
+    }
+    set.add(fn as (payload: any) => void);
+    return () => set!.delete(fn as (payload: any) => void);
+  }
+
+  private emit<K extends ViewerEventName>(name: K, payload: ViewerEventMap[K]): void {
+    for (const fn of this.listeners.get(name) ?? []) {
+      try {
+        (fn as (p: ViewerEventMap[K]) => void)(payload);
+      } catch (err) {
+        console.error(`[andarama] listener de ${name} fallo:`, err);
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Acceso basico
+  // -----------------------------------------------------------------------
+
+  currentScene(): Scene | null {
+    return this.currentId != null ? (this.loaded.get(this.currentId)?.scene ?? null) : null;
+  }
+
+  currentSceneId(): string | null {
+    return this.currentId;
+  }
+
+  currentLang(): string {
+    return this.lang;
+  }
+
+  variables(): VariableStore {
+    return this.vars;
+  }
+
+  audioEngine(): AudioEngine {
+    return this.audio;
+  }
+
+  marzipanoViewer(): any {
+    return this.viewer;
+  }
+
+  /** La escena actual es un gigapíxel 2D (vista plana en {x, y}). */
+  private currentIsFlat(): boolean {
+    return this.currentScene()?.source.kind === "flat";
+  }
+
+  /**
+   * Punto de la pantalla (px relativos al contenedor) a la posición de un
+   * hotspot, también en escenas planas. El editor lo usa para colocar y
+   * soltar: con la vista plana, `screenToCoordinates` no devuelve ángulos.
+   */
+  screenToHotspotCoords(x: number, y: number): { yaw: number; pitch: number } | null {
+    const v = this.viewer.view();
+    if (v?.screenToCoordinates == null) return null;
+    try {
+      return viewCoordsToAngles(v.screenToCoordinates({ x, y }), this.currentIsFlat());
+    } catch {
+      return null;
+    }
+  }
+
+  /** Lo contrario: dónde cae en pantalla la posición de un hotspot. */
+  hotspotCoordsToScreen(yaw: number, pitch: number): { x: number; y: number } | null {
+    const v = this.viewer.view();
+    if (v?.coordinatesToScreen == null) return null;
+    try {
+      return (v.coordinatesToScreen(anglesToViewCoords({ yaw, pitch }, this.currentIsFlat())) as { x: number; y: number } | null) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  text(value: Parameters<typeof resolveL10n>[0]): string {
+    return resolveL10n(value, this.lang, this.tour.meta.defaultLang);
+  }
+
+  view(): ViewParams {
+    const v = this.viewer.view();
+    if (v == null) return { ...DEFAULT_VIEW };
+    const params = v.parameters != null ? v.parameters() : {};
+    return { yaw: params.yaw ?? 0, pitch: params.pitch ?? 0, fov: params.fov ?? 1.2 };
+  }
+
+  setView(view: Partial<ViewParams>): void {
+    const v = this.viewer.view();
+    v?.setParameters?.(view);
+  }
+
+  lookTo(view: Partial<ViewParams>, durationMs = 1000): void {
+    const scene = this.currentId != null ? this.loaded.get(this.currentId) : null;
+    if (scene == null) return;
+    scene.marzScene.lookTo(view, { transitionDuration: this.reducedMotion ? 0 : durationMs });
+  }
+
+  setLang(lang: string): void {
+    if (!this.tour.meta.langs.includes(lang) || lang === this.lang) return;
+    this.lang = lang;
+    try {
+      const url = new URL(location.href);
+      url.searchParams.set("lang", lang);
+      history.replaceState(history.state, "", url.toString());
+    } catch {
+      // sin location
+    }
+    // Reconstruir marcadores de la escena actual con el nuevo idioma.
+    const current = this.currentId;
+    if (current != null) {
+      const entry = this.loaded.get(current);
+      if (entry != null) {
+        entry.markers.destroy();
+        entry.markers = this.createMarkers(entry.scene, entry.marzScene, entry.built.view);
+        entry.markers.updateVisibility(this.currentVideoTime());
+      }
+    }
+    this.emit("langChange", { lang });
+  }
+
+  deepLink(): string {
+    const id = this.currentId ?? this.tour.start.scene;
+    return buildDeepLink(location.href, id, this.view(), this.lang);
+  }
+
+  // -----------------------------------------------------------------------
+  // Carga y cambio de escena
+  // -----------------------------------------------------------------------
+
+  private async ensureLoaded(sceneId: string): Promise<LoadedScene> {
+    const existing = this.loaded.get(sceneId);
+    if (existing != null) return existing;
+    const scene = this.tour.scenes.find((s) => s.id === sceneId);
+    if (scene == null) throw new Error(`Escena inexistente: ${sceneId}`);
+    const initial = scene.initialView ?? DEFAULT_VIEW;
+    const built = await buildScene(scene, this.baseUrl, { ...initial });
+    // Construir la escena tarda: si mientras tanto se destruyó el visor, crear
+    // la escena dentro de Marzipano falla contra un DOM que ya no existe.
+    if (this.destroyed) throw new Error("Visor destruido durante la carga");
+    const marzScene = this.viewer.createScene({
+      source: built.source,
+      geometry: built.geometry,
+      view: built.view,
+      pinFirstLevel: true,
+    });
+    const markers = this.createMarkers(scene, marzScene, built.view);
+    const entry: LoadedScene = { scene, built, marzScene, markers };
+    this.loaded.set(sceneId, entry);
+    return entry;
+  }
+
+  private createMarkers(scene: Scene, marzScene: any, view: any): SceneMarkers {
+    return new SceneMarkers(scene, marzScene, view, this.container, this.vars, {
+      lang: () => this.lang,
+      defaultLang: this.tour.meta.defaultLang,
+      baseUrl: this.baseUrl,
+      defaultSize: this.tour.ui?.hotspotSize,
+      editable: this.options.editMode === true,
+      onDrag: (hotspot, yaw, pitch, phase) => this.emit("hotspotMove", { hotspot, yaw, pitch, phase }),
+      onActivate: (hotspot, element) => this.activateHotspot(hotspot, element),
+    });
+  }
+
+  /**
+   * Precarga el nivel base de una escena multirres (6 tiles pequenas) para
+   * que el fundido de entrada ocurra siempre sobre imagen valida.
+   */
+  private preloadBase(entry: LoadedScene): Promise<void> {
+    const src = entry.scene.source;
+    if (src.kind !== "multires" || this.basePreloaded.has(entry.scene.id)) return Promise.resolve();
+    this.basePreloaded.add(entry.scene.id);
+    const loads = baseLevelTileUrls(src, this.baseUrl).map(
+      (u) =>
+        new Promise<void>((res) => {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.onload = () => res();
+          img.onerror = () => res();
+          img.src = u;
+        }),
+    );
+    return Promise.race([
+      Promise.all(loads).then(() => undefined),
+      new Promise<void>((r) => setTimeout(r, 2500)),
+    ]);
+  }
+
+  /** Libera las escenas menos usadas para no acumular memoria en tours grandes. */
+  private evictStaleScenes(): void {
+    const MAX_LOADED = 12;
+    if (this.loaded.size <= MAX_LOADED) return;
+    const current = this.currentId;
+    const neighbors = new Set<string>();
+    if (current != null) {
+      const scene = this.tour.scenes.find((s) => s.id === current);
+      for (const hs of scene?.hotspots ?? []) if (hs.type === "navigation") neighbors.add(hs.target);
+    }
+    const candidates = [...this.loaded.keys()]
+      .filter((id) => id !== current && !neighbors.has(id))
+      .sort((a, b) => (this.sceneUse.get(a) ?? 0) - (this.sceneUse.get(b) ?? 0));
+    while (this.loaded.size > MAX_LOADED && candidates.length > 0) {
+      const id = candidates.shift()!;
+      const entry = this.loaded.get(id);
+      if (entry == null) continue;
+      try {
+        entry.markers.destroy();
+        this.viewer.destroyScene(entry.marzScene);
+      } catch {
+        // ya destruida
+      }
+      this.loaded.delete(id);
+      this.basePreloaded.delete(id);
+    }
+  }
+
+  /**
+   * Precarga de escenas vecinas segun el grafo (con presupuesto), diferida a
+   * un momento ocioso para no competir con las tiles de la escena actual.
+   */
+  private preloadNeighbors(sceneId: string): void {
+    const schedule: (fn: () => void) => void =
+      typeof requestIdleCallback === "function"
+        ? (fn) => requestIdleCallback(fn, { timeout: 4000 })
+        : (fn) => void setTimeout(fn, 1500);
+    schedule(() => {
+      if (this.destroyed || this.currentId !== sceneId) return;
+      const scene = this.tour.scenes.find((s) => s.id === sceneId);
+      if (scene == null) return;
+      const targets = new Set<string>();
+      for (const hs of scene.hotspots) {
+        if (hs.type === "navigation") targets.add(hs.target);
+      }
+      let budget = 2;
+      for (const t of targets) {
+        if (budget <= 0) break;
+        if (!this.loaded.has(t) && this.tour.scenes.some((s) => s.id === t)) {
+          budget--;
+          void this.ensureLoaded(t)
+            .then((entry) => this.preloadBase(entry))
+            .catch(() => {});
+        }
+      }
+    });
+  }
+
+  async goTo(
+    sceneId: string,
+    opts: {
+      view?: ViewParams;
+      entry?: ConnectionEntry;
+      transition?: TransitionSpec;
+      force?: boolean;
+      skipHistory?: boolean;
+      fromHotspot?: NavigationHotspot;
+      /**
+       * false: confirmar el cambio sin esperar a que Marzipano lo pinte. Lo
+       * usa el modo VR, que dibuja por su cuenta en el bucle de la sesión.
+       */
+      awaitRender?: boolean;
+    } = {},
+  ): Promise<void> {
+    if (this.destroyed) return;
+    if ((this.navBlocked || this.gateId != null) && opts.force !== true) {
+      // Se avisa de por qué no se sale: una narración que aún suena o una
+      // pregunta con compuerta sin acertar. Callarse dejaba al visitante
+      // pulsando un paso que no hacía nada.
+      this.emit(
+        "navBlocked",
+        this.gateId != null ? { reason: this.gateReason ?? "quiz", hotspotId: this.gateId } : { reason: "narration" },
+      );
+      return;
+    }
+    const previousId = this.currentId;
+    const previousView = this.view();
+    let entry: LoadedScene;
+    try {
+      entry = await this.ensureLoaded(sceneId);
+    } catch (err) {
+      // Si el visor murió mientras cargaba, no es un fallo: es un remontaje
+      if (this.destroyed) return;
+      throw err;
+    }
+    // La escena anterior sigue visible hasta que el nivel base este listo:
+    // el fundido nunca ocurre sobre tiles a medio cargar. (En VR no hace
+    // falta: allí no se ve Marzipano.)
+    const awaitRender = opts.awaitRender !== false;
+    if (awaitRender) await this.preloadBase(entry);
+
+    // Registrar tiempo en la escena anterior
+    if (previousId != null && previousId !== sceneId) {
+      this.analytics.track({
+        event: "duration",
+        sceneId: previousId,
+        durationMs: Date.now() - this.sceneEnterTime,
+      });
+      const prev = this.loaded.get(previousId);
+      if (prev?.built.video != null) {
+        prev.built.video.pause();
+      }
+    }
+
+    // Orientacion de entrada
+    const targetView = this.computeEntryView(entry.scene, opts, previousId, previousView);
+    entry.built.view.setParameters?.(targetView);
+
+    const spec = opts.transition ?? opts.fromHotspot?.transition ?? this.tour.transition ?? DEFAULT_TRANSITION;
+    const duration = this.reducedMotion || spec.kind === "cut" ? 0 : (spec.duration ?? 800);
+    const switchOpts: Record<string, unknown> = { transitionDuration: duration };
+    if (spec.kind === "crossRotate" && duration > 0) {
+      const startYaw = targetView.yaw - 0.35;
+      entry.built.view.setParameters?.({ ...targetView, yaw: startYaw });
+      switchOpts.transitionUpdate = (val: number, newScene: any) => {
+        newScene.layer().mergeEffects({ opacity: val });
+        newScene.view().setParameters?.({ ...targetView, yaw: startYaw + 0.35 * val });
+      };
+    } else if (spec.kind === "zoom" && duration > 0 && previousId != null) {
+      const prev = this.loaded.get(previousId);
+      switchOpts.transitionUpdate = (val: number, newScene: any, oldScene: any) => {
+        newScene.layer().mergeEffects({ opacity: val });
+        if (oldScene != null && prev != null) {
+          const params = oldScene.view().parameters();
+          oldScene.view().setParameters?.({ ...params, fov: Math.max(0.25, params.fov * (1 - 0.35 * val)) });
+        }
+      };
+    }
+
+    // Entre el `await` de la carga y este punto puede haberse destruido el
+    // visor —el editor lo remonta en cada guardado—: seguir aquí reventaba
+    // dentro de Marzipano con un TypeError que acababa de aviso rojo.
+    if (this.destroyed) return;
+    this.currentId = sceneId;
+    this.sceneEnterTime = Date.now();
+    await switchMarzipanoScene(this.viewer, entry.marzScene, switchOpts, awaitRender);
+    if (this.destroyed) return;
+
+    if (!opts.skipHistory && previousId != null && previousId !== sceneId) {
+      this.historyStack.push(previousId);
+    }
+
+    // Audio de la escena
+    this.audio.setSceneAudio(entry.scene.audio);
+    if (this.tour.globalAudio != null && previousId == null) {
+      this.audio.setGlobalMusic(this.tour.globalAudio);
+    }
+
+    // Video de la escena
+    this.setupVideoScene(entry);
+
+    entry.markers.updateVisibility(this.currentVideoTime());
+    entry.markers.updatePolygons();
+    this.sceneUse.set(sceneId, Date.now());
+    if (previousId != null && previousId !== sceneId) this.loaded.get(previousId)?.markers.setProjector(null);
+    this.applyProjectionToMarkers();
+    this.projectionPass?.invalidateEnvironment();
+    this.updateGate(entry.scene);
+    this.evictStaleScenes();
+    this.preloadNeighbors(sceneId);
+    this.applyIdleBehaviors();
+    if (this.options.deepLinks !== false) replaceHash(sceneId, this.view());
+
+    this.analytics.track({ event: "scene", sceneId });
+    this.emit("sceneChange", {
+      scene: entry.scene,
+      previous: previousId != null ? (this.loaded.get(previousId)?.scene ?? null) : null,
+    });
+  }
+
+  private computeEntryView(
+    scene: Scene,
+    opts: { view?: ViewParams; entry?: ConnectionEntry; fromHotspot?: NavigationHotspot },
+    previousId: string | null,
+    previousView: ViewParams,
+  ): ViewParams {
+    const initial = scene.initialView ?? DEFAULT_VIEW;
+    if (opts.view != null) return opts.view;
+    const entry = opts.entry ?? opts.fromHotspot?.entry;
+    if (entry == null) return { ...initial };
+    /** Rumbo, visto desde el destino, de la puerta por la que se ha entrado. */
+    const puertaDeVuelta = (): number | null => {
+      if (previousId != null) {
+        const back = scene.hotspots.find((h): h is NavigationHotspot => h.type === "navigation" && h.target === previousId);
+        if (back != null) return back.yaw;
+      }
+      // Sin paso de vuelta: la puerta esta enfrente de por donde se salio
+      return opts.fromHotspot != null ? opts.fromHotspot.yaw + Math.PI : null;
+    };
+    const clampPitch = (p: number): number => Math.max(-0.4, Math.min(0.4, p));
+    switch (entry.mode) {
+      case "initial":
+        // La vista por defecto de la escena, la que el autor ajusta en ella
+        return { ...initial, fov: entry.fov ?? initial.fov };
+      case "fixed":
+        return {
+          yaw: entry.yaw ?? initial.yaw,
+          pitch: entry.pitch ?? initial.pitch,
+          fov: entry.fov ?? initial.fov,
+        };
+      case "relative": {
+        // Con el norte de las dos escenas calibrado sobre el plano se conserva
+        // el rumbo **real**; sin calibrar, el crudo, que solo vale si las dos
+        // fotos comparten el cero.
+        const northTo = scene.map?.north;
+        const northFrom = previousId != null ? this.tour.scenes.find((s) => s.id === previousId)?.map?.north : undefined;
+        const giro = northTo != null && northFrom != null ? northFrom - northTo : 0;
+        return { ...previousView, yaw: previousView.yaw + giro, fov: entry.fov ?? previousView.fov };
+      }
+      case "lookBack": {
+        const puerta = puertaDeVuelta();
+        if (puerta == null) return { ...initial };
+        const back = scene.hotspots.find((h): h is NavigationHotspot => h.type === "navigation" && h.target === previousId);
+        return { yaw: puerta, pitch: clampPitch(back?.pitch ?? 0), fov: entry.fov ?? initial.fov };
+      }
+      case "forward": {
+        // Se entra por la puerta y se sigue de frente: de espaldas a ella
+        const puerta = puertaDeVuelta();
+        if (puerta == null) return { ...initial };
+        return { yaw: puerta + Math.PI, pitch: 0, fov: entry.fov ?? initial.fov };
+      }
+      default:
+        return { ...initial };
+    }
+  }
+
+  /** Volver a la escena anterior del historial de navegacion. */
+  async back(): Promise<boolean> {
+    const prev = this.historyStack.pop();
+    if (prev == null) return false;
+    await this.goTo(prev, { skipHistory: true });
+    return true;
+  }
+
+  canGoBack(): boolean {
+    return this.historyStack.length > 0;
+  }
+
+  // -----------------------------------------------------------------------
+  // Video 360
+  // -----------------------------------------------------------------------
+
+  private setupVideoScene(entry: LoadedScene): void {
+    cancelAnimationFrame(this.videoRaf);
+    const video = entry.built.video;
+    if (video == null) return;
+    const src = entry.scene.source;
+    if (src.kind !== "video") return;
+    if (video.dataset.andaramaInit !== "1") {
+      video.dataset.andaramaInit = "1";
+      void this.attachVideoSource(video, src.hls, src.renditions);
+      video.addEventListener("timeupdate", () => {
+        entry.markers.updateVisibility(video.currentTime);
+      });
+      video.addEventListener("ended", () => {
+        const onEnd = src.onEnd;
+        if (onEnd?.action === "goto" && onEnd.target != null) {
+          void this.goTo(onEnd.target);
+        }
+        // loop lo gestiona video.loop; hold se queda en el ultimo frame
+      });
+    }
+    const pump = (): void => {
+      if (this.currentId !== entry.scene.id) return;
+      if (video.readyState >= 2) entry.built.dynamicAsset?.markDirty();
+      this.videoRaf = requestAnimationFrame(pump);
+    };
+    pump();
+    if (src.autoplay !== false) {
+      void video.play().catch(() => {
+        // requiere gesto: el primer clic la arranca (unlock)
+      });
+    }
+  }
+
+  private async attachVideoSource(
+    video: HTMLVideoElement,
+    hls: string | undefined,
+    renditions: { url: string; type: string; height?: number }[],
+  ): Promise<void> {
+    if (hls != null) {
+      const nativeHls = video.canPlayType("application/vnd.apple.mpegurl") !== "";
+      if (nativeHls) {
+        video.src = resolveUrl(this.baseUrl, hls);
+        return;
+      }
+      try {
+        const mod: any = await import(/* @vite-ignore */ "hls.js" as string);
+        const Hls = mod.default ?? mod;
+        if (Hls?.isSupported?.() === true) {
+          const instance = new Hls({ maxBufferLength: 30 });
+          instance.loadSource(resolveUrl(this.baseUrl, hls));
+          instance.attachMedia(video);
+          return;
+        }
+      } catch {
+        // hls.js no disponible (p. ej. paquete exportado sin el chunk): usar renditions
+      }
+    }
+    // Seleccion automatica de rendition por altura de pantalla.
+    const targetHeight = Math.min(4320, Math.max(1080, screen.height * (devicePixelRatio || 1)));
+    const sorted = [...renditions].sort((a, b) => (a.height ?? 0) - (b.height ?? 0));
+    const best =
+      sorted.find((r) => (r.height ?? 0) >= targetHeight) ?? sorted[sorted.length - 1] ?? sorted[0];
+    if (best != null) {
+      for (const r of sorted) {
+        const sourceEl = document.createElement("source");
+        sourceEl.src = resolveUrl(this.baseUrl, r.url);
+        sourceEl.type = r.type;
+        video.appendChild(sourceEl);
+      }
+      video.load();
+    }
+  }
+
+  videoElement(): HTMLVideoElement | null {
+    return this.currentId != null ? (this.loaded.get(this.currentId)?.built.video ?? null) : null;
+  }
+
+  private currentVideoTime(): number | null {
+    const video = this.videoElement();
+    return video != null ? video.currentTime : null;
+  }
+
+  private currentMarkers(): SceneMarkers | null {
+    return this.currentId != null ? (this.loaded.get(this.currentId)?.markers ?? null) : null;
+  }
+
+  // -----------------------------------------------------------------------
+  // Hotspots
+  // -----------------------------------------------------------------------
+
+  private activateHotspot(hotspot: Hotspot, element: HTMLElement | null): void {
+    const scene = this.currentScene();
+    if (scene == null) return;
+    // Modo edicion: ningun hotspot ejecuta su efecto (navegar, abrir URL,
+    // mutar estado...). Siempre se emite la activacion para que el editor
+    // seleccione el hotspot y abra sus propiedades.
+    if (this.options.editMode === true) {
+      this.emit("hotspotActivate", { hotspot, scene, element });
+      return;
+    }
+    this.audio.unlock();
+    this.autopilotCtl.pauseForInteraction();
+    this.analytics.track({ event: "hotspot", sceneId: scene.id, hotspotId: hotspot.id });
+    this.markTreasure(scene.id, hotspot.id);
+    // Encontrar el tesoro con compuerta abre la salida de su escena
+    if (hotspot.type === "treasure") this.updateGate(scene);
+
+    switch (hotspot.type) {
+      case "navigation":
+        void this.goTo(hotspot.target, { fromHotspot: hotspot, entry: hotspot.entry });
+        return;
+      case "link": {
+        const url =
+          hotspot.scheme === "tel"
+            ? `tel:${hotspot.url}`
+            : hotspot.scheme === "mailto"
+              ? `mailto:${hotspot.url}`
+              : hotspot.url;
+        if (hotspot.newTab !== false && hotspot.scheme !== "tel" && hotspot.scheme !== "mailto") {
+          window.open(url, "_blank", "noopener");
+        } else {
+          location.href = url;
+        }
+        return;
+      }
+      case "state": {
+        this.vars.apply(hotspot.actions);
+        if (hotspot.thenGoto != null) {
+          void this.goTo(hotspot.thenGoto, { entry: hotspot.thenEntry, transition: { kind: "fade", duration: 350 } });
+        }
+        return;
+      }
+      case "polygon": {
+        const action = hotspot.action;
+        if (action == null || action.kind === "none") return;
+        if (action.kind === "goto") {
+          void this.goTo(action.target, { entry: action.entry });
+          return;
+        }
+        if (action.kind === "openUrl") {
+          if (action.newTab !== false) window.open(action.url, "_blank", "noopener");
+          else location.href = action.url;
+          return;
+        }
+        if (action.kind === "setVars") {
+          this.vars.apply(action.actions);
+          return;
+        }
+        if (action.kind === "openHotspot") {
+          const target = scene.hotspots.find((h) => h.id === action.hotspotId);
+          if (target != null) this.activateHotspot(target, this.currentMarkers()?.elementFor(target.id) ?? null);
+          return;
+        }
+        return;
+      }
+      case "audio": {
+        if (hotspot.mode === "spatial") {
+          // Fuente posicional real: suena anclada al punto y sigue la vista
+          // (panner HRTF). Clic alterna reproducir/parar; no abre panel.
+          const playing = this.audio.toggleSpatialHotspot(hotspot.id, {
+            id: hotspot.id,
+            url: hotspot.url,
+            yaw: hotspot.yaw,
+            pitch: hotspot.pitch,
+            volume: hotspot.volume,
+            loop: hotspot.loop ?? true,
+          });
+          element?.setAttribute("aria-pressed", String(playing));
+          this.audio.updateListener(this.view().yaw, this.view().pitch);
+          return;
+        }
+        this.emit("hotspotActivate", { hotspot, scene, element });
+        return;
+      }
+      default:
+        this.emit("hotspotActivate", { hotspot, scene, element });
+    }
+  }
+
+  /** Activa un hotspot por id (paleta de comandos, autopilot, LTI...). */
+  openHotspot(hotspotId: string): void {
+    const scene = this.currentScene();
+    const hs = scene?.hotspots.find((h) => h.id === hotspotId);
+    if (hs != null) this.activateHotspot(hs, this.currentMarkers()?.elementFor(hotspotId) ?? null);
+  }
+
+  focusFirstHotspot(): void {
+    this.currentMarkers()?.focusFirst();
+  }
+
+  // -----------------------------------------------------------------------
+  // Quiz y busqueda del tesoro
+  // -----------------------------------------------------------------------
+
+  /**
+   * Registra la respuesta a una pregunta. `selected` son las opciones
+   * marcadas: viajan con el resultado para que el servidor recalcule la nota
+   * con el tour publicado en vez de fiarse de la que manda el navegador.
+   */
+  reportQuizAnswer(hotspotId: string, correct: boolean, points: number, selected?: string[], questionId?: string): void {
+    const sceneId = this.currentId ?? "";
+    // Sin pregunta explícita es la primera (la única en la forma heredada).
+    // El marcador queda superado con todas sus preguntas acertadas, o con la
+    // nota mínima del marcador si la tiene.
+    const r = this.quiz.record(hotspotId, correct, points, {
+      ...(selected != null ? { selected } : {}),
+      ...(questionId != null ? { questionId } : {}),
+    });
+    if (r.hotspotPassed) this.vars.set(`quiz_${hotspotId}`, true);
+    this.emit("quizChange", this.quizState());
+    this.analytics.track({
+      event: "quiz",
+      sceneId,
+      hotspotId,
+      meta: { correct, ...(r.questionId !== hotspotId ? { questionId: r.questionId } : {}) },
+    });
+    // La compuerta se recalcula entera: con varias preguntas con compuerta en
+    // la escena, solo se abre cuando todas están superadas.
+    const scene = this.currentScene();
+    if (scene != null) this.updateGate(scene);
+  }
+
+  /** Un formulario se ha enviado (ahora o en una visita anterior, si es de un solo envío). */
+  markFormSubmitted(hotspotId: string): void {
+    if (this.formsSent.has(hotspotId)) return;
+    this.formsSent.add(hotspotId);
+    const scene = this.currentScene();
+    if (scene != null) this.updateGate(scene);
+  }
+
+  formSubmitted(hotspotId: string): boolean {
+    return this.formsSent.has(hotspotId);
+  }
+
+  /** Respuesta ya terminada de una pregunta (la primera, la que puntúa). */
+  quizAnswer(hotspotId: string, questionId?: string): { correct: boolean; points: number; selected?: string[] } | null {
+    return this.quiz.answer(hotspotId, questionId);
+  }
+
+  /** ¿Está superado el quiz de este marcador (todas acertadas o nota mínima)? */
+  quizPassed(hotspotId: string): boolean {
+    return this.quiz.passed(hotspotId);
+  }
+
+  /**
+   * ¿Ha dejado de retener la compuerta de este quiz? Superado, o con intentos
+   * limitados y todas sus preguntas terminadas (la nota cuenta como fallo).
+   */
+  quizGateOpen(hotspotId: string): boolean {
+    return this.quiz.gateOpen(hotspotId);
+  }
+
+  /**
+   * Estado del quiz del tour. Cada pregunta cuenta por separado: un marcador
+   * con cinco preguntas suma cinco al total y sus puntos al máximo.
+   */
+  quizState(): QuizStateEvent {
+    return this.quiz.state();
+  }
+
+  /**
+   * Bloqueo manual de la navegación (integraciones).
+   *
+   * @deprecated Las compuertas de pregunta, formulario y tesoro las lleva el
+   * propio visor. Antes el quiz llamaba aquí y el visitante leía el aviso de
+   * la narración; ya no emite `narrationBlock` ni toca las compuertas.
+   */
+  setNavigationBlocked(blocked: boolean): void {
+    this.navBlocked = blocked;
+  }
+
+  /** Hotspot con compuerta que retiene al visitante en esta escena, si lo hay. */
+  gateHotspotId(): string | null {
+    return this.gateId;
+  }
+
+  /**
+   * Al entrar en una escena, y cada vez que se responde, se envía o se
+   * encuentra algo, se recalcula qué la retiene: quizzes con compuerta sin
+   * superar, formularios con compuerta sin enviar y tesoros con compuerta sin
+   * encontrar. La salida se abre solo cuando no queda ninguno. Con intentos
+   * limitados, agotarlos en todas las preguntas del marcador también la abre
+   * (la nota cuenta como fallo); con intentos ilimitados hay que acertar.
+   */
+  private updateGate(scene: Scene): void {
+    if (this.options.editMode === true) {
+      this.setGate(null, null);
+      return;
+    }
+    const pendiente = pendingGates(scene.hotspots, {
+      quizCorrect: (id) => this.quiz.gateOpen(id),
+      formSent: (id) => this.formsSent.has(id),
+      treasureFound: (id) => this.treasureFound.has(id),
+    })[0];
+    this.setGate(pendiente?.hotspotId ?? null, pendiente?.reason ?? null);
+  }
+
+  private setGate(hotspotId: string | null, reason: GateReason | null): void {
+    if (hotspotId === this.gateId) return;
+    this.gateId = hotspotId;
+    this.gateReason = reason;
+    this.container.classList.toggle("anda-nav-gated", hotspotId != null);
+    this.emit("gateChange", { hotspotId, reason });
+  }
+
+  /**
+   * Tesoros del tour.
+   *
+   * Un hotspot de tipo «treasure» colocado en una escena **es** un tesoro: no
+   * hay que declararlo en ninguna lista aparte. La configuración global
+   * (`treasureHunt.targets`) se sigue respetando para los tours antiguos.
+   */
+  private treasureTargets(): { hotspotId: string; sceneId: string }[] {
+    const propios = this.tour.scenes.flatMap((s) =>
+      s.hotspots.filter((h) => h.type === "treasure").map((h) => ({ hotspotId: h.id, sceneId: s.id })),
+    );
+    if (propios.length > 0) return propios;
+    const hunt = this.tour.treasureHunt;
+    return hunt?.enabled === true ? hunt.targets : [];
+  }
+
+  private markTreasure(sceneId: string, hotspotId: string): void {
+    const targets = this.treasureTargets();
+    const target = targets.find((t) => t.hotspotId === hotspotId && t.sceneId === sceneId);
+    if (target == null || this.treasureFound.has(hotspotId)) return;
+    this.treasureFound.add(hotspotId);
+    this.vars.set(`found_${hotspotId}`, true);
+    this.emit("treasureProgress", {
+      found: this.treasureFound.size,
+      total: targets.length,
+      lastFound: hotspotId,
+    });
+  }
+
+  treasureState(): { found: number; total: number; foundIds: string[] } {
+    return { found: this.treasureFound.size, total: this.treasureTargets().length, foundIds: [...this.treasureFound] };
+  }
+
+  /** ¿Hay búsqueda del tesoro en este tour? */
+  hasTreasureHunt(): boolean {
+    return this.treasureTargets().length > 0;
+  }
+
+  // -----------------------------------------------------------------------
+  // Autorotate / autopilot / interaccion
+  // -----------------------------------------------------------------------
+
+  private applyIdleBehaviors(): void {
+    const scene = this.currentScene();
+    const sceneCfg = scene?.autorotate;
+    const cfg =
+      sceneCfg === false ? null : normalizeAutorotate(sceneCfg ?? undefined) ?? normalizeAutorotate(this.tour.autorotate);
+    if (cfg == null || this.reducedMotion || this.options.editMode === true) {
+      if (this.idleMovementActive) {
+        this.viewer.setIdleMovement(Infinity, null);
+        this.idleMovementActive = false;
+      }
+      return;
+    }
+    const movement = Marzipano.autorotate({
+      yawSpeed: cfg.direction === "ccw" ? -cfg.speed : cfg.speed,
+      targetPitch: null,
+      targetFov: null,
+    });
+    this.viewer.setIdleMovement(cfg.delay * 1000, movement);
+    this.idleMovementActive = true;
+  }
+
+  /** Todas las rutas del tour, para el quiosco y su lista. */
+  autopilotRoutes(): { id: string; title?: unknown; loop: boolean }[] {
+    return (this.tour.autopilot ?? []).map((r) => ({ id: r.id, title: r.title, loop: r.loop === true }));
+  }
+
+  /**
+   * Encadena todas las rutas (modo quiosco). Se repite sin fin solo si alguna
+   * ruta lo pide con «repetir en bucle»; si no, termina y avisa con
+   * `autopilotChange` (reason «finished»).
+   */
+  startAutopilotChain(): void {
+    const rutas = this.tour.autopilot ?? [];
+    if (rutas.length > 0) void this.autopilotCtl.startChain(rutas, { loop: rutas.some((r) => r.loop === true) });
+  }
+
+  startAutopilot(routeId?: string): void {
+    const route: AutopilotRoute | undefined =
+      routeId != null ? this.tour.autopilot?.find((r) => r.id === routeId) : this.tour.autopilot?.[0];
+    if (route != null) void this.autopilotCtl.start(route);
+  }
+
+  stopAutopilot(): void {
+    this.autopilotCtl.stop();
+  }
+
+  autopilotActive(): boolean {
+    return this.autopilotCtl.active;
+  }
+
+  /** Gira hasta un rumbo absoluto por el camino más corto. */
+  private turnTo(yaw: number, durationMs: number): Promise<void> {
+    const actual = this.view().yaw;
+    let delta = yaw - actual;
+    while (delta > Math.PI) delta -= 2 * Math.PI;
+    while (delta < -Math.PI) delta += 2 * Math.PI;
+    return this.rotateBy(delta, durationMs);
+  }
+
+  private rotateBy(deltaYaw: number, durationMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.reducedMotion) {
+        resolve();
+        return;
+      }
+      const v = this.view();
+      this.lookTo({ yaw: v.yaw + deltaYaw }, durationMs);
+      setTimeout(resolve, durationMs + 50);
+    });
+  }
+
+  /** Soporte opcional de gamepad (§2.6): stick izquierdo gira, derecho zoom. */
+  private startGamepadLoop(): void {
+    if (this.tour.controls?.gamepad !== true || typeof navigator.getGamepads !== "function") return;
+    const tick = (): void => {
+      if (this.destroyed) return;
+      requestAnimationFrame(tick);
+      const pad = navigator.getGamepads()[0];
+      if (pad == null) return;
+      const dead = (v: number): number => (Math.abs(v) < 0.15 ? 0 : v);
+      const dx = dead(pad.axes[0] ?? 0);
+      const dy = dead(pad.axes[1] ?? 0);
+      const dz = dead(pad.axes[3] ?? 0);
+      if (dx !== 0 || dy !== 0 || dz !== 0) {
+        const v = this.view();
+        this.setView({
+          yaw: v.yaw + dx * 0.04,
+          pitch: Math.max(-Math.PI / 2, Math.min(Math.PI / 2, v.pitch - dy * 0.03)),
+          fov: Math.max(0.35, Math.min(2.4, v.fov + dz * 0.03)),
+        });
+      }
+    };
+    requestAnimationFrame(tick);
+  }
+
+  private setupInteractionListeners(): void {
+    this.startGamepadLoop();
+    const onFirstInteraction = (): void => this.audio.unlock();
+    this.container.addEventListener("pointerdown", onFirstInteraction, { once: true });
+    this.container.addEventListener("keydown", onFirstInteraction, { once: true });
+
+    this.container.addEventListener("pointerdown", () => this.autopilotCtl.pauseForInteraction());
+    this.container.addEventListener(
+      "wheel",
+      () => this.autopilotCtl.pauseForInteraction(),
+      { passive: true },
+    );
+
+    // Doble clic para zoom
+    this.container.addEventListener("dblclick", (e) => {
+      const v = this.viewer.view();
+      // La vista plana no tiene yaw ni fov: el zoom es de la rueda
+      if (v?.screenToCoordinates == null || this.currentIsFlat()) return;
+      const rect = this.container.getBoundingClientRect();
+      const coords = v.screenToCoordinates({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+      if (coords != null) {
+        this.lookTo({ yaw: coords.yaw, pitch: coords.pitch, fov: Math.max(0.4, this.view().fov * 0.55) }, 500);
+      }
+    });
+
+    // viewChange: reproyectar poligonos, escalar marcadores, listener espacial, deep link
+    let hashThrottle = 0;
+    const emitViewChange = (): void => {
+      const v = this.view();
+      this.currentMarkers()?.updatePolygons();
+      this.currentMarkers()?.updateScale(v.fov);
+      this.audio.updateListener(v.yaw, v.pitch);
+      this.emit("viewChange", v);
+      const now = Date.now();
+      if (this.options.deepLinks !== false && this.currentId != null && now - hashThrottle > 500) {
+        hashThrottle = now;
+        replaceHash(this.currentId, v);
+      }
+    };
+    this.viewer.addEventListener("viewChange", emitViewChange);
+  }
+
+  private setupDeepLinks(): void {
+    if (this.options.deepLinks === false) return;
+    window.addEventListener("hashchange", () => {
+      const link = parseDeepLink(location.href);
+      if (link.sceneId != null && link.sceneId !== this.currentId) {
+        void this.goTo(link.sceneId, { view: link.view as ViewParams | undefined });
+      } else if (link.view != null) {
+        this.setView(link.view);
+      }
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Giroscopio
+  // -----------------------------------------------------------------------
+
+  /**
+   * Pide el permiso de movimiento y orientación sin activar nada más.
+   *
+   * Existe para poder pedirlo **dentro del gesto** que abre el modo cartón: en
+   * iOS el permiso solo se concede si la llamada nace de una pulsación, y
+   * montar antes la pantalla completa o la textura del entorno ya lo invalida.
+   */
+  async requestMotionPermission(): Promise<boolean> {
+    if (!DeviceOrientationControlMethod.needsPermission()) return true;
+    return DeviceOrientationControlMethod.requestPermission();
+  }
+
+  async enableGyro(): Promise<boolean> {
+    if (this.gyroEnabled) return true;
+    const granted = await DeviceOrientationControlMethod.requestPermission();
+    if (!granted) return false;
+    if (this.gyroMethod == null) {
+      this.gyroMethod = new DeviceOrientationControlMethod();
+      this.viewer.controls().registerMethod("gyro", this.gyroMethod as any, false);
+    }
+    this.gyroMethod.start();
+    this.viewer.controls().enableMethod("gyro");
+    this.gyroEnabled = true;
+    return true;
+  }
+
+  disableGyro(): void {
+    if (!this.gyroEnabled) return;
+    this.viewer.controls().disableMethod("gyro");
+    this.gyroMethod?.stop();
+    this.gyroEnabled = false;
+  }
+
+  gyroActive(): boolean {
+    return this.gyroEnabled;
+  }
+
+  // -----------------------------------------------------------------------
+  // Proyecciones
+  // -----------------------------------------------------------------------
+
+  private supportsProjections(): boolean {
+    return typeof WebGLRenderingContext !== "undefined";
+  }
+
+  setProjection(projection: Projection): void {
+    if (this.projectionPass == null || !this.projectionPass.supported) return;
+    if (projection !== "rectilinear" && this.currentScene()?.source.kind === "flat") return;
+    this.projectionPass.setProjection(projection, !this.reducedMotion);
+    // Sin animación el pase no da fotogramas de transición: se aplica ya
+    if (this.reducedMotion) this.syncProjectionMarkers(this.projectionPass.frameState);
+  }
+
+  currentProjection(): Projection {
+    return this.projectionPass?.currentProjection ?? "rectilinear";
+  }
+
+  /**
+   * Los marcadores siguen a la proyección. Con el little planet (o el ojo de
+   * pez, Panini, arquitectónica) asentado, cada hotspot se recoloca donde el
+   * shader dibuja su dirección; durante el fundido se esconden, porque en
+   * medio no están en ningún sitio; y en rectilínea vuelve a mandar Marzipano.
+   */
+  private syncProjectionMarkers(state: ProjectionFrameState): void {
+    this.projectionState = state;
+    const activa = state.mode !== "rectilinear" && state.mix >= 0.999;
+    const transicion = !activa && state.mix > 0.001;
+    this.container.classList.toggle("anda-projection-active", activa);
+    this.container.classList.toggle("anda-projection-transition", transicion);
+    this.applyProjectionToMarkers();
+  }
+
+  /** Proyector en uso, uno por proyección: se reutiliza fotograma a fotograma. */
+  private projector: { mode: Projection; fn: (yaw: number, pitch: number) => { x: number; y: number } | null } | null = null;
+
+  private applyProjectionToMarkers(): void {
+    const markers = this.currentMarkers();
+    if (markers == null) return;
+    const state = this.projectionState;
+    if (state.mode !== "rectilinear" && state.mix >= 0.999) {
+      const mode = state.mode;
+      if (this.projector?.mode !== mode) {
+        this.projector = {
+          mode,
+          fn: (yaw, pitch) => {
+            const w = this.container.clientWidth;
+            const h = this.container.clientHeight;
+            return projectToScreen(mode, this.view(), w / Math.max(1, h), { yaw, pitch });
+          },
+        };
+      }
+      markers.setProjector(this.projector.fn);
+      markers.updateProjectedPositions();
+    } else {
+      markers.setProjector(null);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // VR
+  // -----------------------------------------------------------------------
+
+  async enterVr(): Promise<void> {
+    await this.vr.enter();
+  }
+
+  exitVr(): void {
+    this.vr.exit();
+  }
+
+  vrActive(): boolean {
+    return this.vr.active;
+  }
+
+  /**
+   * Estado de la sesion inmersiva. Lo usan la skin, los integradores y las
+   * pruebas automatizadas para saber que esta ocurriendo dentro de las gafas.
+   */
+  vrState(): { active: boolean; mode: "xr" | "cardboard" | null; hands: boolean; openHotspotId: string | null; hotspots: number } {
+    return {
+      active: this.vr.active,
+      mode: this.vr.currentMode,
+      hands: this.vr.handsTracked,
+      openHotspotId: this.vr.openHotspotId,
+      hotspots: this.vrHotspots().length,
+    };
+  }
+
+  /**
+   * Hotspots visibles en VR: TODOS los tipos, no solo la navegación. Los
+   * polígonos usan el primero de sus vértices como ancla del billboard.
+   */
+  /** Un tipo de hotspot está disponible en gafas según los ajustes del tour. */
+  private vrTypeAllowed(type: string): boolean {
+    const cfg = this.tour.vr;
+    const mode = cfg?.hotspots ?? "all";
+    if (mode === "all") return true;
+    if (mode === "navigationOnly") return type === "navigation";
+    // "custom": la navegación nunca se apaga (sin ella el tour es una foto)
+    if (type === "navigation") return true;
+    return cfg?.types?.[type] !== false;
+  }
+
+  private vrHotspots(): VrHotspot[] {
+    const scene = this.currentScene();
+    if (scene == null) return [];
+    return scene.hotspots
+      .filter((h) => this.vrTypeAllowed(h.type))
+      .filter((h) => evalConditions(h.conditions, this.vars, this.lang, this.currentVideoTime()))
+      .map((h) => {
+        const anchor =
+          h.type === "polygon" && h.points.length > 0
+            ? { yaw: h.points[0]!.yaw, pitch: h.points[0]!.pitch }
+            : { yaw: h.yaw, pitch: h.pitch };
+        // Mismo punto de la panorámica que en el visor plano: el pitch cambia
+        // de signo al pasar al convenio VR (antes salían reflejados).
+        const vr = marzipanoToVr(anchor);
+        return {
+          id: h.id,
+          yaw: vr.yaw,
+          pitch: vr.pitch,
+          // El tamaño elegido en el editor también vale dentro de las gafas
+          scale: (h.style?.icon?.size ?? this.tour.ui?.hotspotSize ?? 44) / 44,
+          label: this.text(h.label) || this.text(h.altText),
+          type: h.type,
+          target: h.type === "navigation" ? (h as NavigationHotspot).target : undefined,
+          hotspot: h,
+        };
+      });
+  }
+
+  /**
+   * Entorno del modo inmersivo. Lo inmediato es la vista previa (va dentro
+   * del tour.json); lo bueno llega después sin bloquear: las teselas del cubo
+   * en las multirresolución y la imagen completa en las equirectangulares.
+   */
+  private async buildVrEnvironment(): Promise<VrEnvironment> {
+    const entry = this.currentId != null ? this.loaded.get(this.currentId) : null;
+    if (entry == null) throw new Error("Sin escena activa");
+    const src = entry.scene.source;
+    if (src.kind === "video" && entry.built.video != null) {
+      return { element: entry.built.video, stereo: src.stereo ?? "mono", dynamic: true };
+    }
+    const previewUrl = "preview" in src && src.preview != null ? resolveUrl(this.baseUrl, src.preview) : null;
+    const preview = previewUrl != null ? await loadImageAsync(previewUrl).catch(() => null) : null;
+    if (src.kind === "equirect") {
+      return { element: preview, stereo: src.stereo ?? "mono", dynamic: false, fullUrl: resolveUrl(this.baseUrl, src.url) };
+    }
+    if (src.kind === "multires") {
+      return { element: preview, stereo: "mono", dynamic: false, cube: this.vrCubeSource(src) };
+    }
+    if (src.kind === "cubemap" && preview != null) {
+      return { element: preview, stereo: "mono", dynamic: false };
+    }
+    throw new Error("Esta escena no soporta VR");
+  }
+
+  private vrCubeSource(src: { base: string; faceSize: number; levels: number; tileSize: number; extension?: string }): VrCubeSource {
+    return {
+      base: resolveUrl(this.baseUrl, src.base).replace(/\/$/, ""),
+      faceSize: src.faceSize,
+      levels: src.levels,
+      tileSize: src.tileSize,
+      extension: src.extension ?? "webp",
+    };
+  }
+
+  /** Escenas a las que se puede saltar desde la actual: el modo VR las descarga antes. */
+  private vrPrefetch(): VrPrefetch[] {
+    const scene = this.currentScene();
+    if (scene == null) return [];
+    const out: VrPrefetch[] = [];
+    const seen = new Set<string>();
+    for (const h of scene.hotspots) {
+      if (h.type !== "navigation") continue;
+      const target = (h as NavigationHotspot).target;
+      if (seen.has(target) || target === scene.id) continue;
+      seen.add(target);
+      const dest = this.tour.scenes.find((s) => s.id === target);
+      if (dest == null) continue;
+      const src = dest.source;
+      if (src.kind === "multires") out.push({ cube: this.vrCubeSource(src) });
+      else if (src.kind === "equirect") out.push({ url: resolveUrl(this.baseUrl, src.url) });
+    }
+    return out;
+  }
+
+  /**
+   * Equirectangular para las proyecciones (planeta pequeño, etc.): esas sí
+   * necesitan una imagen entera, así que las multirresolución se recomponen.
+   */
+  private async buildProjectionEnvironment(): Promise<{ element: TexImageSource; dynamic: boolean }> {
+    const entry = this.currentId != null ? this.loaded.get(this.currentId) : null;
+    if (entry == null) throw new Error("Sin escena activa");
+    const src = entry.scene.source;
+    if (src.kind === "video" && entry.built.video != null) return { element: entry.built.video, dynamic: true };
+    const preview = "preview" in src && src.preview != null ? resolveUrl(this.baseUrl, src.preview) : null;
+    if (src.kind === "equirect") {
+      const img = await loadImageAsync(resolveUrl(this.baseUrl, src.url)).catch((error: unknown) => {
+        if (preview == null) throw error;
+        return loadImageAsync(preview);
+      });
+      return { element: img, dynamic: false };
+    }
+    if (src.kind === "multires") {
+      const canvas = await assembleEquirectFromCube(resolveUrl(this.baseUrl, src.base), src, 2048);
+      if (canvas != null) return { element: canvas, dynamic: false };
+    }
+    if (preview != null) return { element: await loadImageAsync(preview), dynamic: false };
+    throw new Error("Esta escena no tiene imagen equirectangular");
+  }
+
+
+  // -----------------------------------------------------------------------
+  // Rendimiento
+  // -----------------------------------------------------------------------
+
+  private startFpsMonitor(): void {
+    const tick = (t: number): void => {
+      if (this.destroyed) return;
+      if (this.lastFrame > 0) {
+        const dt = t - this.lastFrame;
+        if (dt > 0 && dt < 500) {
+          this.fpsWindow.push(1000 / dt);
+          if (this.fpsWindow.length > 120) this.fpsWindow.shift();
+        }
+      }
+      this.lastFrame = t;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    const check = setInterval(() => {
+      if (this.destroyed) {
+        clearInterval(check);
+        return;
+      }
+      if (this.fpsWindow.length < 60) return;
+      const avg = this.fpsWindow.reduce((a, b) => a + b, 0) / this.fpsWindow.length;
+      if (avg < 40 && !this.degraded) {
+        this.degraded = true;
+        this.container.classList.add("anda-degraded");
+      } else if (avg > 55 && this.degraded) {
+        this.degraded = false;
+        this.container.classList.remove("anda-degraded");
+      }
+    }, 4000);
+  }
+
+  currentFps(): number {
+    if (this.fpsWindow.length === 0) return 60;
+    return this.fpsWindow.reduce((a, b) => a + b, 0) / this.fpsWindow.length;
+  }
+
+  private startHeartbeat(): void {
+    this.heartbeatTimer = setInterval(() => {
+      if (document.visibilityState !== "visible" || this.currentId == null) return;
+      const v = this.view();
+      this.analytics.track({ event: "heartbeat", sceneId: this.currentId, yaw: v.yaw, pitch: v.pitch });
+    }, 5000);
+  }
+
+  trackShare(): void {
+    this.analytics.track({ event: "share", sceneId: this.currentId ?? undefined });
+  }
+
+  trackForm(hotspotId: string): void {
+    this.analytics.track({ event: "form", sceneId: this.currentId ?? undefined, hotspotId });
+  }
+
+  // -----------------------------------------------------------------------
+
+  destroy(): void {
+    this.destroyed = true;
+    if (this.heartbeatTimer != null) clearInterval(this.heartbeatTimer);
+    cancelAnimationFrame(this.videoRaf);
+    this.analytics.destroy();
+    this.autopilotCtl.stop();
+    this.vr.destroy();
+    this.projectionPass?.destroy();
+    this.audio.destroy();
+    for (const entry of this.loaded.values()) {
+      entry.markers.destroy();
+      entry.built.video?.pause();
+    }
+    this.loaded.clear();
+    this.viewer.destroy();
+  }
+}
+
+function loadImageAsync(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(`No se pudo cargar: ${url}`));
+    img.src = url;
+  });
+}
+
+
+async function assembleEquirectFromCube(
+  base: string,
+  src: { levels: number; tileSize: number; faceSize: number; extension?: string },
+  maxFace: number,
+): Promise<HTMLCanvasElement | null> {
+  try {
+    const sizes: number[] = [];
+    let s = src.faceSize;
+    for (let i = 0; i < src.levels; i++) {
+      sizes.unshift(s);
+      s = Math.ceil(s / 2);
+    }
+    let level = 0;
+    for (let i = 0; i < sizes.length; i++) {
+      if (sizes[i]! <= maxFace) level = i;
+    }
+    const faceSize = sizes[level]!;
+    const tiles = Math.ceil(faceSize / src.tileSize);
+    const ext = src.extension ?? "webp";
+    const faces: Record<string, HTMLCanvasElement> = {};
+    const cleanBase = base.replace(/\/$/, "");
+    await Promise.all(
+      ["f", "b", "l", "r", "u", "d"].map(async (face) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = faceSize;
+        canvas.height = faceSize;
+        const ctx = canvas.getContext("2d")!;
+        await Promise.all(
+          Array.from({ length: tiles * tiles }, async (_, i) => {
+            const x = i % tiles;
+            const y = Math.floor(i / tiles);
+            const img = await loadImageAsync(`${cleanBase}/${level}/${face}/${y}/${x}.${ext}`);
+            ctx.drawImage(img, x * src.tileSize, y * src.tileSize);
+          }),
+        );
+        faces[face] = canvas;
+      }),
+    );
+    // Reproyeccion cubo -> equirect por muestreo directo.
+    const outW = Math.min(4096, faceSize * 4);
+    const outH = outW / 2;
+    const out = document.createElement("canvas");
+    out.width = outW;
+    out.height = outH;
+    const octx = out.getContext("2d")!;
+    const outData = octx.createImageData(outW, outH);
+    const faceData: Record<string, ImageData> = {};
+    for (const [k, c] of Object.entries(faces)) {
+      faceData[k] = c.getContext("2d")!.getImageData(0, 0, faceSize, faceSize);
+    }
+    const o = outData.data;
+    for (let py = 0; py < outH; py++) {
+      // Fila 0 = cenit (equirect estandar, como los previews y las fotos)
+      const phi = (0.5 - (py + 0.5) / outH) * Math.PI;
+      const cosPhi = Math.cos(phi);
+      const sinPhi = Math.sin(phi);
+      for (let px = 0; px < outW; px++) {
+        const theta = ((px + 0.5) / outW) * 2 * Math.PI - Math.PI;
+        const dx = cosPhi * Math.sin(theta);
+        const dy = sinPhi;
+        const dz = cosPhi * Math.cos(theta);
+        const ax = Math.abs(dx);
+        const ay = Math.abs(dy);
+        const az = Math.abs(dz);
+        let face: string;
+        let u: number;
+        let v: number;
+        if (az >= ax && az >= ay) {
+          if (dz > 0) {
+            face = "f";
+            u = dx / az;
+            v = -dy / az;
+          } else {
+            face = "b";
+            u = -dx / az;
+            v = -dy / az;
+          }
+        } else if (ax >= ay) {
+          if (dx > 0) {
+            face = "r";
+            u = -dz / ax;
+            v = -dy / ax;
+          } else {
+            face = "l";
+            u = dz / ax;
+            v = -dy / ax;
+          }
+        } else {
+          if (dy > 0) {
+            face = "u";
+            u = dx / ay;
+            v = dz / ay;
+          } else {
+            face = "d";
+            u = dx / ay;
+            v = -dz / ay;
+          }
+        }
+        const fd = faceData[face]!;
+        const fx = Math.min(faceSize - 1, Math.max(0, Math.round(((u + 1) / 2) * (faceSize - 1))));
+        const fy = Math.min(faceSize - 1, Math.max(0, Math.round(((v + 1) / 2) * (faceSize - 1))));
+        const si = (fy * faceSize + fx) * 4;
+        const di = (py * outW + px) * 4;
+        o[di] = fd.data[si]!;
+        o[di + 1] = fd.data[si + 1]!;
+        o[di + 2] = fd.data[si + 2]!;
+        o[di + 3] = 255;
+      }
+    }
+    octx.putImageData(outData, 0, 0);
+    return out;
+  } catch {
+    return null;
+  }
+}

@@ -1,0 +1,94 @@
+/**
+ * Genera el bundle standalone del visor (dist/bundle/):
+ *  - viewer.js         entrada ESM (motor + skin) con code splitting
+ *  - chunks/*.js       leaflet, hls.js, pdfjs, model-viewer (carga perezosa)
+ *  - leaflet.css       hoja de estilos de Leaflet
+ *  - pdf.worker.min.mjs worker de PDF.js
+ * Lo consumen el servido de tours publicados (/t/{slug}) y el exportador.
+ */
+import { build } from "esbuild";
+import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
+import { buildVersion } from "../../tooling/build-version.mjs";
+
+const here = dirname(fileURLToPath(import.meta.url));
+// Versión del visor: window.Andarama.version y data-version del contenedor
+const define = {
+  "process.env.NODE_ENV": '"production"',
+  __ANDARAMA_VERSION__: JSON.stringify(buildVersion(here)),
+};
+const outdir = join(here, "dist/bundle");
+const require = createRequire(import.meta.url);
+
+await mkdir(outdir, { recursive: true });
+
+const result = await build({
+  entryPoints: [join(here, "src/main.ts")],
+  bundle: true,
+  splitting: true,
+  format: "esm",
+  outdir,
+  entryNames: "viewer",
+  chunkNames: "chunks/[name]-[hash]",
+  minify: true,
+  sourcemap: true,
+  target: ["es2020"],
+  metafile: true,
+  logLevel: "warning",
+  define,
+});
+
+// Bundle sin trocear para el export «HTML único»: un index.html abierto con
+// doble clic (file://) no puede resolver import() dinámicos —el navegador los
+// bloquea por CORS—, así que ese modo necesita todo el código en un solo
+// fichero, sin chunks perezosos.
+await build({
+  entryPoints: [join(here, "src/main.ts")],
+  bundle: true,
+  splitting: false,
+  format: "iife",
+  outfile: join(outdir, "viewer.standalone.js"),
+  minify: true,
+  sourcemap: false,
+  target: ["es2020"],
+  logLevel: "warning",
+  define,
+});
+
+// Assets adicionales autocontenidos
+const leafletCss = require.resolve("leaflet/dist/leaflet.css");
+await copyFile(leafletCss, join(outdir, "leaflet.css"));
+try {
+  const pdfWorker = require.resolve("pdfjs-dist/build/pdf.worker.min.mjs");
+  await copyFile(pdfWorker, join(outdir, "pdf.worker.min.mjs"));
+} catch {
+  console.warn("pdfjs-dist worker no encontrado; el visor PDF usara el fallback nativo");
+}
+
+await writeFile(join(outdir, "meta.json"), JSON.stringify(result.metafile));
+
+// Listado de ficheros del bundle (lo usa el exportador para copiar el visor)
+const { readdir } = await import("node:fs/promises");
+const listFiles = async (dir, prefix = "") => {
+  const out = [];
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (entry.name === "files.json" || entry.name === "meta.json") continue;
+    if (entry.isDirectory()) out.push(...(await listFiles(join(dir, entry.name), `${prefix}${entry.name}/`)));
+    else out.push(`${prefix}${entry.name}`);
+  }
+  return out;
+};
+await writeFile(join(outdir, "files.json"), JSON.stringify(await listFiles(outdir)));
+
+// Presupuesto de rendimiento (§4.1): runtime base < 250 KB gzip.
+const mainJs = await readFile(join(outdir, "viewer.js"));
+const gzipKb = gzipSync(mainJs).length / 1024;
+const rawKb = (await stat(join(outdir, "viewer.js"))).size / 1024;
+console.log(`viewer.js: ${rawKb.toFixed(0)} KB (${gzipKb.toFixed(0)} KB gzip)`);
+if (gzipKb > 250) {
+  console.error(`PRESUPUESTO EXCEDIDO: viewer.js pesa ${gzipKb.toFixed(0)} KB gzip (limite 250 KB)`);
+  process.exit(1);
+}

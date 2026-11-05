@@ -1,0 +1,641 @@
+import { Hono } from "hono";
+import { z } from "zod";
+import { desc, eq, isNull, sql } from "drizzle-orm";
+import { auditLog, coupons, demoRequests, feedbackReports, jobs, media, orgMembers, orgs, projects, publications, users, webhooks } from "@andarama/db";
+import type { AppEnv } from "../lib/context.js";
+import { badRequest, conflict, forbidden, notFound } from "../lib/errors.js";
+import { hmacSign } from "@andarama/adapters";
+import { newId, nowMs, parseJson, slugify } from "../lib/util.js";
+import { requireAuth } from "../lib/session.js";
+import { isInstanceAdmin } from "../lib/authz.js";
+import { audit, getSettings, saveSettings } from "../lib/helpers.js";
+import { createCoupons, normalizeCouponCode } from "../lib/coupons.js";
+import { isListedAdmin } from "../lib/admins.js";
+import { PLANS, type PlanSlug } from "../lib/plans.js";
+import { attributionCsv, clickIdOf, type Attribution } from "../lib/attribution.js";
+import { bumpGalleryGeneration, galleryInfo, galleryStatus } from "./publish.js";
+
+/** Slugs de plan que se pueden conceder a mano o por cupón. */
+const PLAN_SLUGS = Object.keys(PLANS) as [PlanSlug, ...PlanSlug[]];
+
+/** Panel de administracion global de la instancia (§3.7). */
+export function adminRoutes(): Hono<AppEnv> {
+  const r = new Hono<AppEnv>();
+
+  r.use("*", async (c, next) => {
+    const auth = requireAuth(c);
+    if (!isInstanceAdmin(auth.user)) throw forbidden("Solo administradores de la instancia");
+    await next();
+  });
+
+  r.get("/overview", async (c) => {
+    const db = c.get("db");
+    const [userCount, orgCount, projectCount, pubCount, mediaBytes, queuedJobs] = await Promise.all([
+      db.select({ c: sql<number>`count(*)` }).from(users),
+      db.select({ c: sql<number>`count(*)` }).from(orgs),
+      db.select({ c: sql<number>`count(*)` }).from(projects).where(isNull(projects.deletedAt)),
+      db.select({ c: sql<number>`count(*)` }).from(publications),
+      db.select({ c: sql<number>`coalesce(sum(${media.bytes}), 0)` }).from(media).where(isNull(media.deletedAt)),
+      db.select({ c: sql<number>`count(*)` }).from(jobs).where(eq(jobs.status, "queued")),
+    ]);
+    return c.json({
+      users: Number(userCount[0]?.c ?? 0),
+      orgs: Number(orgCount[0]?.c ?? 0),
+      projects: Number(projectCount[0]?.c ?? 0),
+      publications: Number(pubCount[0]?.c ?? 0),
+      storageBytes: Number(mediaBytes[0]?.c ?? 0),
+      queuedJobs: Number(queuedJobs[0]?.c ?? 0),
+    });
+  });
+
+  r.get("/settings", async (c) => c.json(await getSettings(c.get("db"))));
+
+  r.put("/settings", async (c) => {
+    const body = z
+      .object({
+        name: z.string().min(1).max(120).optional(),
+        logo: z.string().optional(),
+        defaultLangs: z.array(z.string()).optional(),
+        registration: z.enum(["open", "invite", "domain"]).optional(),
+        allowedDomains: z.array(z.string()).optional(),
+        maxUploadMb: z.number().int().positive().max(10240).optional(),
+        trashRetentionDays: z.number().int().positive().max(365).optional(),
+        legal: z.object({ privacy: z.string().optional(), cookies: z.string().optional(), terms: z.string().optional() }).optional(),
+        defaultQuotaBytes: z.number().int().positive().optional(),
+        defaultQuotaTours: z.number().int().positive().optional(),
+      })
+      .parse(await c.req.json());
+    await saveSettings(c.get("db"), body);
+    await audit(c, "instance.settings", "settings", "instance", body);
+    return c.json({ ok: true });
+  });
+
+  // ------- Usuarios -------
+
+  r.get("/users", async (c) => {
+    const db = c.get("db");
+    const rows = await db.select().from(users).orderBy(desc(users.createdAt)).limit(500);
+    return c.json(
+      rows.map((u) => ({
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        roleGlobal: u.roleGlobal,
+        emailVerified: u.emailVerified,
+        totp: u.totpSecret != null,
+        sso: u.idpSubject != null,
+        clerk: u.clerkId != null,
+        plan: u.plan,
+        planOverride: u.planOverride,
+        trialEndsAt: u.trialEndsAt,
+        createdAt: u.createdAt,
+      })),
+    );
+  });
+
+  /** Alta de usuario desde el panel (con contraseña temporal). */
+  r.post("/users", async (c) => {
+    const db = c.get("db");
+    const runtime = c.get("runtime");
+    const body = z
+      .object({
+        email: z.string().email(),
+        name: z.string().min(1).max(120),
+        password: z.string().min(10).max(200),
+        roleGlobal: z.enum(["admin", "user"]).default("user"),
+        orgId: z.string().optional(),
+        orgRole: z.enum(["admin", "editor", "collaborator", "reader"]).default("editor"),
+      })
+      .parse(await c.req.json());
+    const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, body.email.toLowerCase())).limit(1);
+    if (existing[0] != null) throw conflict("Ya existe un usuario con ese email");
+    const id = newId();
+    await db.insert(users).values({
+      id,
+      email: body.email.toLowerCase(),
+      name: body.name,
+      passwordHash: await runtime.passwords.hash(body.password),
+      roleGlobal: body.roleGlobal,
+      emailVerified: true,
+      createdAt: nowMs(),
+      updatedAt: nowMs(),
+    });
+    if (body.orgId != null) {
+      await db.insert(orgMembers).values({ orgId: body.orgId, userId: id, role: body.orgRole, createdAt: nowMs() });
+    }
+    await audit(c, "admin.user_create", "user", id, { email: body.email, roleGlobal: body.roleGlobal });
+    if (body.roleGlobal === "admin") {
+      await audit(c, "admin.role_change", "user", id, { from: null, to: "admin", via: "user_create" });
+    }
+    return c.json({ id }, 201);
+  });
+
+  r.patch("/users/:userId", async (c) => {
+    const db = c.get("db");
+    const userId = c.req.param("userId");
+    const body = z
+      .object({
+        roleGlobal: z.enum(["admin", "user"]).optional(),
+        name: z.string().optional(),
+        /** Plan concedido a mano (vitalicio, cortesía); null lo retira. */
+        planOverride: z.enum(PLAN_SLUGS).nullable().optional(),
+        /** Fin de la prueba gratuita (epoch ms); null la retira, una fecha futura la alarga. */
+        trialEndsAt: z.number().int().nullable().optional(),
+      })
+      .parse(await c.req.json());
+    const auth = requireAuth(c);
+    const target = (await db.select().from(users).where(eq(users.id, userId)).limit(1))[0];
+    if (target == null) throw notFound("Usuario no encontrado");
+    if (userId === auth.user.id && body.roleGlobal === "user") {
+      const admins = await db.select().from(users).where(eq(users.roleGlobal, "admin"));
+      if (admins.length <= 1) throw badRequest("No puedes quitarte el rol de administrador siendo el último");
+    }
+    await db
+      .update(users)
+      .set({
+        ...(body.roleGlobal != null ? { roleGlobal: body.roleGlobal } : {}),
+        ...(body.name != null ? { name: body.name } : {}),
+        ...(body.planOverride !== undefined ? { planOverride: body.planOverride, planUpdatedAt: nowMs() } : {}),
+        ...(body.trialEndsAt !== undefined ? { trialEndsAt: body.trialEndsAt } : {}),
+        updatedAt: nowMs(),
+      })
+      .where(eq(users.id, userId));
+    await audit(c, "admin.user_update", "user", userId, body);
+    if (body.roleGlobal != null && body.roleGlobal !== target.roleGlobal) {
+      await audit(c, "admin.role_change", "user", userId, { from: target.roleGlobal, to: body.roleGlobal, via: "panel" });
+    }
+    return c.json({ ok: true });
+  });
+
+  r.delete("/users/:userId", async (c) => {
+    const db = c.get("db");
+    const auth = requireAuth(c);
+    const userId = c.req.param("userId");
+    if (userId === auth.user.id) throw badRequest("No puedes eliminar tu propia cuenta desde aquí");
+    await db.delete(users).where(eq(users.id, userId));
+    await audit(c, "admin.user_delete", "user", userId);
+    return c.json({ ok: true });
+  });
+
+  // ------- Organizaciones y cuotas -------
+
+  r.get("/orgs", async (c) => {
+    const db = c.get("db");
+    const rows = await db.select().from(orgs);
+    const usage = await db
+      .select({ orgId: media.orgId, bytes: sql<number>`coalesce(sum(${media.bytes}), 0)` })
+      .from(media)
+      .where(isNull(media.deletedAt))
+      .groupBy(media.orgId);
+    const usageMap = new Map(usage.map((u) => [u.orgId, Number(u.bytes)]));
+    return c.json(rows.map((o) => ({ ...o, usedBytes: usageMap.get(o.id) ?? 0 })));
+  });
+
+  /** Alta de organización desde el panel. */
+  r.post("/orgs", async (c) => {
+    const db = c.get("db");
+    const body = z
+      .object({
+        name: z.string().min(1).max(120),
+        ownerUserId: z.string().optional(),
+        quotaBytes: z.number().int().positive().optional(),
+        quotaTours: z.number().int().positive().optional(),
+      })
+      .parse(await c.req.json());
+    const id = newId();
+    let slug = slugify(body.name);
+    const taken = await db.select({ id: orgs.id }).from(orgs).where(eq(orgs.slug, slug)).limit(1);
+    if (taken[0] != null) slug = `${slug}-${id.slice(0, 5)}`;
+    const settings = await getSettings(db);
+    await db.insert(orgs).values({
+      id,
+      name: body.name,
+      slug,
+      quotaBytes: body.quotaBytes ?? settings.defaultQuotaBytes ?? 5368709120,
+      quotaTours: body.quotaTours ?? settings.defaultQuotaTours ?? 100,
+      ownerId: body.ownerUserId ?? null,
+      createdAt: nowMs(),
+    });
+    if (body.ownerUserId != null) {
+      await db.insert(orgMembers).values({ orgId: id, userId: body.ownerUserId, role: "admin", createdAt: nowMs() });
+    }
+    await audit(c, "admin.org_create", "org", id, { name: body.name });
+    return c.json({ id, slug }, 201);
+  });
+
+  r.patch("/orgs/:orgId", async (c) => {
+    const db = c.get("db");
+    const body = z
+      .object({
+        name: z.string().min(1).max(120).optional(),
+        quotaBytes: z.number().int().positive().optional(),
+        quotaTours: z.number().int().positive().optional(),
+      })
+      .parse(await c.req.json());
+    await db.update(orgs).set(body).where(eq(orgs.id, c.req.param("orgId")));
+    await audit(c, "admin.org_quota", "org", c.req.param("orgId"), body);
+    return c.json({ ok: true });
+  });
+
+  // ------- Cupones -------
+
+  /**
+   * Atribución publicitaria en CSV: usuario, plan, alta, primer pago, gclid
+   * y utm_*. Para subir conversiones a Google Ads y Microsoft Ads a mano.
+   * `?since=` (epoch ms) acota por fecha de alta; `?only=attributed` deja
+   * solo a quienes llegaron con algún identificador.
+   */
+  r.get("/attribution/export", async (c) => {
+    const db = c.get("db");
+    if (c.get("config").clerk == null) throw notFound("Esta instancia no tiene planes: no hay atribución que exportar");
+    const since = Number(c.req.query("since") ?? "0") || 0;
+    const soloAtribuidos = c.req.query("only") === "attributed";
+    const rows = await db.select().from(users).orderBy(desc(users.createdAt));
+    const filas = rows
+      .filter((u) => u.createdAt >= since && (!soloAtribuidos || u.attributionJson != null))
+      .map((u) => ({
+        userId: u.id,
+        email: u.email,
+        plan: u.plan,
+        planOverride: u.planOverride,
+        createdAt: u.createdAt,
+        planUpdatedAt: u.planUpdatedAt,
+        firstPaidAt: u.firstPaidAt,
+        attributedAt: u.attributedAt,
+        attribution: u.attributionJson != null ? parseJson<Attribution | null>(u.attributionJson, null) : null,
+      }));
+    await audit(c, "admin.attribution_export", "users", "*", { count: filas.length, since });
+    return new Response(attributionCsv(filas), {
+      headers: {
+        "content-type": "text/csv; charset=utf-8",
+        "content-disposition": `attachment; filename="atribucion-${new Date().toISOString().slice(0, 10)}.csv"`,
+        "cache-control": "private, no-store",
+      },
+    });
+  });
+
+  /** Solicitudes de demo de la web pública, de la más reciente a la más antigua. */
+  r.get("/demo-requests", async (c) => {
+    const db = c.get("db");
+    const rows = await db.select().from(demoRequests).orderBy(desc(demoRequests.createdAt)).limit(500);
+    return c.json(
+      rows.map((d) => {
+        const a = d.attributionJson != null ? parseJson<Attribution | null>(d.attributionJson, null) : null;
+        return {
+          id: d.id,
+          name: d.name,
+          institution: d.institution,
+          email: d.email,
+          message: d.message,
+          lang: d.lang,
+          source: d.source,
+          page: d.page,
+          adConsent: d.adConsent,
+          clickId: clickIdOf(a) != null,
+          utmSource: a?.utm_source ?? null,
+          utmCampaign: a?.utm_campaign ?? null,
+          notifiedAt: d.notifiedAt,
+          createdAt: d.createdAt,
+        };
+      }),
+    );
+  });
+
+  /** Informes de problemas enviados desde el Studio, del más reciente al más antiguo. */
+  r.get("/feedback", async (c) => {
+    const db = c.get("db");
+    const rows = await db
+      .select({ report: feedbackReports, userName: users.name, userEmail: users.email })
+      .from(feedbackReports)
+      .leftJoin(users, eq(feedbackReports.userId, users.id))
+      .orderBy(desc(feedbackReports.createdAt))
+      .limit(500);
+    return c.json(
+      rows.map(({ report: f, userName, userEmail }) => ({
+        id: f.id,
+        userId: f.userId,
+        userName,
+        userEmail,
+        description: f.description,
+        context: parseJson<Record<string, unknown>>(f.contextJson, {}),
+        hasImage: f.imageKey != null,
+        notifiedAt: f.notifiedAt,
+        createdAt: f.createdAt,
+      })),
+    );
+  });
+
+  /** La captura adjunta a un informe (solo administradores: puede llevar datos de otros). */
+  r.get("/feedback/:id/image", async (c) => {
+    const db = c.get("db");
+    const [f] = await db.select().from(feedbackReports).where(eq(feedbackReports.id, c.req.param("id"))).limit(1);
+    if (f?.imageKey == null) throw notFound("El informe no tiene captura");
+    const obj = await c.get("runtime").storage.get(f.imageKey);
+    if (obj == null) throw notFound("Captura no encontrada en almacenamiento");
+    return new Response(obj.body as unknown as BodyInit, {
+      headers: { "content-type": f.imageMime ?? "application/octet-stream", "cache-control": "private, no-store" },
+    });
+  });
+
+  /** Tanda nueva: devuelve los códigos en claro, que es cuando se reparten. */
+  r.post("/coupons", async (c) => {
+    const db = c.get("db");
+    const auth = requireAuth(c);
+    const body = z
+      .object({
+        count: z.number().int().min(1).max(500),
+        plan: z.enum(PLAN_SLUGS).default("vitalicio"),
+        batch: z.string().max(60).optional(),
+        note: z.string().max(200).optional(),
+        expiresAt: z.number().int().positive().nullable().optional(),
+      })
+      .parse(await c.req.json());
+    const codes = await createCoupons(db, {
+      count: body.count,
+      plan: body.plan,
+      batch: body.batch,
+      note: body.note,
+      expiresAt: body.expiresAt ?? undefined,
+      createdBy: auth.user.id,
+    });
+    await audit(c, "admin.coupons_create", "coupon", body.batch ?? null, { count: codes.length, plan: body.plan });
+    return c.json({ codes, plan: body.plan, batch: body.batch ?? null }, 201);
+  });
+
+  r.get("/coupons", async (c) => {
+    const db = c.get("db");
+    const batch = c.req.query("batch");
+    const rows = await db
+      .select({
+        code: coupons.code,
+        plan: coupons.plan,
+        batch: coupons.batch,
+        note: coupons.note,
+        expiresAt: coupons.expiresAt,
+        redeemedAt: coupons.redeemedAt,
+        redeemedBy: coupons.redeemedBy,
+        email: users.email,
+        createdAt: coupons.createdAt,
+      })
+      .from(coupons)
+      .leftJoin(users, eq(coupons.redeemedBy, users.id))
+      .where(batch != null && batch !== "" ? eq(coupons.batch, batch) : undefined)
+      .orderBy(desc(coupons.createdAt))
+      .limit(1000);
+    return c.json({
+      coupons: rows,
+      total: rows.length,
+      redeemed: rows.filter((row) => row.redeemedAt != null).length,
+    });
+  });
+
+  /** Retira un cupón que aún no se ha canjeado. */
+  r.delete("/coupons/:code", async (c) => {
+    const db = c.get("db");
+    const code = normalizeCouponCode(c.req.param("code"));
+    const row = (await db.select().from(coupons).where(eq(coupons.code, code)).limit(1))[0];
+    if (row == null) throw notFound("Ese cupón no existe");
+    if (row.redeemedBy != null) throw conflict("Ese cupón ya está canjeado: no se puede retirar");
+    await db.delete(coupons).where(eq(coupons.code, code));
+    await audit(c, "admin.coupon_delete", "coupon", code);
+    return c.json({ ok: true });
+  });
+
+  // ------- Tours publicados -------
+
+  r.get("/publications", async (c) => {
+    const db = c.get("db");
+    const rows = await db
+      .select({ pub: publications, title: projects.title, orgId: projects.orgId })
+      .from(publications)
+      .innerJoin(projects, eq(publications.projectId, projects.id));
+    return c.json(rows.map(({ pub, title, orgId }) => ({ ...pub, title, orgId })));
+  });
+
+  /** Despublicar desde el panel (el admin de instancia no necesita ser miembro). */
+  r.post("/publications/:projectId/unpublish", async (c) => {
+    const db = c.get("db");
+    const runtime = c.get("runtime");
+    const projectId = c.req.param("projectId");
+    const pub = (await db.select().from(publications).where(eq(publications.projectId, projectId)).limit(1))[0];
+    if (pub == null) throw notFound("El proyecto no está publicado");
+    await runtime.storage.delete(`pub/${pub.slug}/current.json`);
+    await runtime.kv.delete(`pub:${pub.slug}`);
+    await db.delete(publications).where(eq(publications.projectId, projectId));
+    await db.update(projects).set({ status: "draft", updatedAt: nowMs() }).where(eq(projects.id, projectId));
+    await audit(c, "admin.unpublish", "project", projectId, { slug: pub.slug });
+    return c.json({ ok: true });
+  });
+
+  // ------- Moderación de la galería (/explorar/) -------
+
+  /** Fichas de la galería por estado: pendientes (por defecto), aprobadas o rechazadas. */
+  r.get("/gallery", async (c) => {
+    const db = c.get("db");
+    const status = z.enum(["pending", "approved", "rejected"]).catch("pending").parse(c.req.query("status"));
+    const rows = await db
+      .select({ pub: publications, title: projects.title, orgId: projects.orgId, orgName: orgs.name, authorEmail: users.email })
+      .from(publications)
+      .innerJoin(projects, eq(publications.projectId, projects.id))
+      .innerJoin(orgs, eq(projects.orgId, orgs.id))
+      .leftJoin(users, eq(publications.publishedBy, users.id))
+      .where(eq(publications.inGallery, true))
+      .orderBy(desc(publications.publishedAt));
+    return c.json(
+      rows
+        .filter(({ pub }) => galleryStatus(pub) === status)
+        .map(({ pub, title, orgId, orgName, authorEmail }) => ({
+          projectId: pub.projectId,
+          slug: pub.slug,
+          title,
+          orgId,
+          orgName,
+          authorEmail,
+          visibility: pub.visibility,
+          publishedAt: pub.publishedAt,
+          reviewedAt: pub.galleryReviewedAt,
+          hasPoster: pub.posterKey != null,
+          gallery: galleryInfo(pub),
+        })),
+    );
+  });
+
+  /** Aprobar o rechazar una ficha. Rechazarla no despublica el recorrido: solo lo saca de la galería. */
+  r.post("/gallery/:projectId/:decision", async (c) => {
+    const db = c.get("db");
+    const decision = z.enum(["approve", "reject"]).parse(c.req.param("decision"));
+    const projectId = c.req.param("projectId");
+    const pub = (await db.select().from(publications).where(eq(publications.projectId, projectId)).limit(1))[0];
+    if (pub == null) throw notFound("El proyecto no está publicado");
+    if (!pub.inGallery) throw badRequest("Esa publicación no pide ficha en la galería");
+    await db
+      .update(publications)
+      .set({ galleryApproved: decision === "approve", galleryReviewedAt: nowMs() })
+      .where(eq(publications.projectId, projectId));
+    await bumpGalleryGeneration(c.get("runtime").kv);
+    await audit(c, decision === "approve" ? "admin.gallery_approve" : "admin.gallery_reject", "project", projectId, { slug: pub.slug });
+    return c.json({ ok: true, status: decision === "approve" ? "approved" : "rejected" });
+  });
+
+  // ------- Cola de trabajos -------
+
+  r.get("/jobs", async (c) => {
+    const db = c.get("db");
+    const rows = await db.select().from(jobs).orderBy(desc(jobs.createdAt)).limit(200);
+    return c.json(rows);
+  });
+
+  r.post("/jobs/:jobId/retry", async (c) => {
+    const db = c.get("db");
+    const runtime = c.get("runtime");
+    const job = (await db.select().from(jobs).where(eq(jobs.id, c.req.param("jobId"))).limit(1))[0];
+    if (job == null) throw notFound();
+    await db.update(jobs).set({ status: "queued", error: null, updatedAt: nowMs() }).where(eq(jobs.id, job.id));
+    await runtime.queue.enqueue({ id: job.id, kind: job.kind, payload: parseJson(job.payloadJson, {}), orgId: job.orgId });
+    return c.json({ ok: true });
+  });
+
+  // ------- Auditoria -------
+
+  r.get("/audit", async (c) => {
+    const db = c.get("db");
+    const rows = await db.select().from(auditLog).orderBy(desc(auditLog.at)).limit(500);
+    return c.json(rows);
+  });
+
+  // ------- Webhooks -------
+
+  r.get("/webhooks", async (c) => {
+    const rows = await c.get("db").select().from(webhooks);
+    return c.json(rows);
+  });
+
+  r.post("/webhooks", async (c) => {
+    const body = z
+      .object({
+        url: z.string().url(),
+        events: z.array(z.enum(["publish", "unpublish", "form_submission"])),
+        orgId: z.string().optional(),
+        projectId: z.string().optional(),
+        secret: z.string().optional(),
+      })
+      .parse(await c.req.json());
+    const id = newId();
+    await c.get("db").insert(webhooks).values({
+      id,
+      orgId: body.orgId ?? null,
+      projectId: body.projectId ?? null,
+      url: body.url,
+      eventsJson: JSON.stringify(body.events),
+      secret: body.secret ?? null,
+      createdAt: nowMs(),
+    });
+    return c.json({ id }, 201);
+  });
+
+  /** Activar/desactivar un webhook sin borrarlo. */
+  r.patch("/webhooks/:id", async (c) => {
+    const body = z.object({ active: z.boolean() }).parse(await c.req.json());
+    await c.get("db").update(webhooks).set({ active: body.active }).where(eq(webhooks.id, c.req.param("id")));
+    return c.json({ ok: true });
+  });
+
+  /** Envío de prueba: verifica URL, conectividad y firma. */
+  r.post("/webhooks/:id/test", async (c) => {
+    const db = c.get("db");
+    const hook = (await db.select().from(webhooks).where(eq(webhooks.id, c.req.param("id"))).limit(1))[0];
+    if (hook == null) throw notFound();
+    const body = JSON.stringify({ event: "test", at: nowMs(), message: "Envío de prueba de Andarama" });
+    const signature = hook.secret != null ? await hmacSign(hook.secret, body) : undefined;
+    try {
+      const res = await fetch(hook.url, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(signature != null ? { "x-anda-signature": signature } : {}) },
+        body,
+      });
+      return c.json({ ok: res.ok, status: res.status });
+    } catch (err) {
+      return c.json({ ok: false, status: 0, error: String(err instanceof Error ? err.message : err) });
+    }
+  });
+
+  r.delete("/webhooks/:id", async (c) => {
+    await c.get("db").delete(webhooks).where(eq(webhooks.id, c.req.param("id")));
+    return c.json({ ok: true });
+  });
+
+  // ------- Copia de seguridad (export/import completo §3.7) -------
+
+  r.get("/backup", async (c) => {
+    const db = c.get("db");
+    const schema = await import("@andarama/db");
+    const tables = [
+      "users", "orgs", "orgMembers", "projects", "projectMembers", "scenes", "hotspots",
+      "media", "mediaDerivatives", "versions", "publications", "translations",
+      "comments", "formSubmissions", "quizResults", "auditLog", "instanceSettings", "webhooks", "ltiRegistrations", "demoRequests",
+    ] as const;
+    const dump: Record<string, unknown[]> = {};
+    for (const name of tables) {
+      dump[name] = await db.select().from((schema as Record<string, any>)[name]);
+    }
+    return new Response(JSON.stringify({ format: "anda-backup", version: 1, exportedAt: nowMs(), tables: dump }), {
+      headers: {
+        "content-type": "application/json",
+        "content-disposition": `attachment; filename="anda-backup-${new Date().toISOString().slice(0, 10)}.json"`,
+      },
+    });
+  });
+
+  r.post("/backup/import", async (c) => {
+    const db = c.get("db");
+    const doc = z
+      .object({ format: z.literal("anda-backup"), version: z.number(), tables: z.record(z.array(z.record(z.unknown()))) })
+      .parse(await c.req.json());
+    const schema = await import("@andarama/db");
+    let imported = 0;
+    // Orden respetando claves foraneas
+    const order = [
+      "users", "orgs", "orgMembers", "projects", "projectMembers", "scenes", "hotspots",
+      "media", "mediaDerivatives", "versions", "publications", "translations",
+      "comments", "formSubmissions", "quizResults", "instanceSettings", "webhooks", "ltiRegistrations", "demoRequests",
+    ];
+    const config = c.get("config");
+    const roleChanges: { id: string; email: string; from: unknown; to: "admin" | "user" }[] = [];
+    for (const name of order) {
+      const rows = doc.tables[name];
+      const table = (schema as Record<string, any>)[name];
+      if (rows == null || table == null) continue;
+      for (const original of rows) {
+        let row = original;
+        if (name === "users") {
+          // Una copia no concede administración: el rol se decide aquí, con
+          // la lista ADMIN_EMAILS, y no con lo que diga el fichero
+          const email = typeof row.email === "string" ? row.email : "";
+          const role: "admin" | "user" = isListedAdmin(config, email) ? "admin" : "user";
+          const existing = typeof row.id === "string" ? (await db.select({ id: users.id }).from(users).where(eq(users.id, row.id)).limit(1))[0] : undefined;
+          if (existing == null && (row.roleGlobal !== role || role === "admin")) {
+            roleChanges.push({ id: String(row.id), email, from: row.roleGlobal ?? null, to: role });
+          }
+          row = { ...row, roleGlobal: role };
+        }
+        try {
+          await db.insert(table).values(row as never);
+          imported++;
+        } catch {
+          // fila ya existente: se omite (import idempotente)
+          if (name === "users") {
+            const i = roleChanges.findIndex((ch) => ch.id === String(row.id));
+            if (i >= 0) roleChanges.splice(i, 1);
+          }
+        }
+      }
+    }
+    for (const change of roleChanges) {
+      await audit(c, "admin.role_change", "user", change.id, { from: change.from, to: change.to, via: "backup_import", email: change.email });
+    }
+    await audit(c, "admin.backup_import", "instance", null, { imported, roleChanges: roleChanges.length });
+    return c.json({ imported, roleChanges: roleChanges.length });
+  });
+
+  return r;
+}

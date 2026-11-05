@@ -1,0 +1,59 @@
+[
+  {
+    "fecha": "2026-10-11",
+    "titulo": "Live group editing",
+    "items": [
+      "Several people can edit the same tour at once: each one appears in the header with their initials and colour, and clicking them takes you to the scene they are in.",
+      "What each person does reaches the others without reloading: scenes, hotspots, links, order and settings. If two people save at the same time, the changes are merged without losing what is being typed.",
+      "If someone has a scene or hotspot panel open, the others see \"… is editing this\" and those fields become read-only so nobody overwrites anybody, with \"Edit anyway\" if needed.",
+      "The panorama shows where each person is looking and pointing, with a mark in their colour and their name.",
+      "If the live connection drops, a discreet notice says so; changes are still saved and it reconnects on its own.",
+      "Tours shared with you from another organization appear in Projects, under \"Shared with you\", showing whose they are and your role. Inside you see their thumbnails and library and, if you can edit, the photos you upload stay in the tour."
+    ]
+  },
+  {
+    "fecha": "2026-10-11",
+    "titulo": "Sharper, more complete virtual reality",
+    "items": [
+      "In the headset, scenes look up to twice as sharp (8K photos or larger) and load sooner: full resolution arrives piece by piece, starting with what is in front of you, and neighbouring scenes download while you look around, so they appear complete when you jump.",
+      "PDFs can be read inside the headset, page by page, with previous, next and scrolling, using either the controllers or your gaze.",
+      "Uploaded videos play inside the headset with a play and pause button. YouTube, Vimeo or PeerTube videos show their title and thumbnail, plus a button to leave virtual reality and watch them in the tour."
+    ]
+  },
+  {
+    "fecha": "2026-10-11",
+    "titulo": "More of what the teaching team asked for",
+    "items": [
+      "Next to “Mute”, an arrow opens the scene's sound: one click stops it playing in the published tour without losing the files, and it turns back on the same way. “Scene audio” has the same switch and a “Remove” button for ambient sound and for narration.",
+      "The “Action (variables)” hotspot is explained with an example, the key and the door, and comes with that change already in place when you add it. Its description makes clear that it is not a treasure or a question.",
+      "The viewer's floor plan can be enlarged to almost full screen, its points are easier to hit with a finger and, with “Floor plan open at start” in the tour settings, it shows as a minimap from the beginning.",
+      "ZIP export no longer stalls near the end: a download that stops receiving data is cut off and retried, and packages over 4 GB or with more than 65,535 files come out whole.",
+      "The tour floor plan in the viewer: the map button at the bottom left (or the M key) shows and hides it, and the plan no longer covers that button. The panel has a cross to close it and a \"Show spots\" checkbox to see the plan without the dots. In the editor, an unplaced scene is placed by clicking it and then its spot on the plan, and the image you upload from \"Add plan\" is set straight away."
+    ]
+  },
+  {
+    "fecha": "2026-10-02",
+    "titulo": "What the teaching team asked for",
+    "items": [
+      "ZIP export no longer stops halfway: failed files are retried, and if one still can't be fetched the ZIP is created anyway and lists it in LEEME.md. It is also faster.",
+      "Export and Share now explain which option to choose, with a link to the Moodle guide.",
+      "\"Use current view\" really sets the start view: reloading the tour no longer restores the position stored in the browser address.",
+      "New links arrive at the destination scene's default view, and the arrivals panel says which view each link uses.",
+      "In virtual reality you arrive facing the right way, quiz, form and treasure gates also block the way, and on Android gaze activates hotspots even if the phone moves a little.",
+      "One quiz can now hold several questions: they are answered one at a time, with a summary at the end, an optional pass mark and the full score sent through SCORM and LTI. If attempts are limited and run out, the gate opens and the question counts as wrong.",
+      "Property sections start collapsed and remember how you left them.",
+      "A visible \"Mute\" button in scenes with sound.",
+      "A \"Floor plan\" button in the scene list, with the steps to build a plan with points that lead to each scene.",
+      "Renaming a scene, also from the graph, offers to rename its photo too.",
+      "New \"Team\" section in the sidebar and a \"People\" button in the editor to share a tour. Teamwork is available on every plan.",
+      "In Tour settings: background music for the whole tour (it stops when a scene has its own sound), your own logo, watermark and nadir patch, and badge text.",
+      "The \"Counter / state\" hotspot is now called \"Action (variables)\", summarises what it does and has a conditions editor without JSON.",
+      "\"How do I do it?\" links to the documentation in quiz, treasure, action, polygon and form.",
+      "Long labels can be read in full by tapping them, on phones too.",
+      "In a guided visit, when the guide opens a text, an image or a quiz, it also opens for everyone following.",
+      "New templates in the Education group: \"Graded quiz: trees and seasons\" and \"Treasure hunt: machines and trades\".",
+      "An \"Unpublished changes\" notice next to Publish, and Studio updates itself when a new version is out.",
+      "This what's new panel, the \"Report a problem\" button and the version number in the sidebar."
+    ]
+  }
+]

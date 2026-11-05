@@ -1,0 +1,300 @@
+import { serve } from "@hono/node-server";
+import { createReadStream, existsSync } from "node:fs";
+import { stat } from "node:fs/promises";
+import { dirname, extname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  createArgon2Hasher,
+  createFsStorage,
+  createInProcessQueue,
+  createSmtpEmail,
+  createSqliteDb,
+  createSqliteKv,
+  createSqlAnalytics,
+  migrateSqlite,
+} from "@andarama/adapters/node";
+import type { PlatformRuntime } from "@andarama/adapters";
+import { createRealtimeServer } from "@andarama/realtime/node";
+import { createApp } from "./app.js";
+import type { AppConfig, Db } from "./lib/context.js";
+import { parseTemplatesConfig } from "./lib/templates.js";
+import { processJob } from "./jobs.js";
+import { parseAdminEmails } from "./lib/admins.js";
+import { guessContentType } from "./routes/projects.js";
+
+/**
+ * Entrada self-host: un proceso Node, un volumen (/data), un puerto (§5.7).
+ * SQLite + FS + ws + cola en proceso + argon2id. Sirve tambien el Studio y
+ * el bundle del visor como estaticos.
+ */
+
+const here = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Lee una variable de entorno tratando la cadena vacía como «no definida».
+ * El docker-compose pasa todas las opcionales como `${VAR:-}`, así que llegan
+ * vacías; con `!= null` bastaba eso para encender Clerk, OIDC o S3 sin
+ * claves y dejar el Studio colgado en «Cargando».
+ */
+function env(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value == null || value === "" ? undefined : value;
+}
+
+async function main(): Promise<void> {
+  // docker-compose pasa las variables opcionales vacías (`${X:-}`): una
+  // variable vacía es una variable sin definir, no una clave de Clerk "".
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === "") delete process.env[key];
+  }
+  const dataDir = resolve(env("DATA_DIR") ?? "./data");
+  const port = parseInt(env("PORT") ?? "8788", 10);
+  const publicUrl = (env("PUBLIC_URL") ?? `http://localhost:${port}`).replace(/\/$/, "");
+  const secret = env("APP_SECRET") ?? "dev-secret-cambia-esto";
+  if (secret === "dev-secret-cambia-esto" && env("NODE_ENV") === "production") {
+    console.error("ATENCION: define APP_SECRET en produccion");
+  }
+
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(dataDir, { recursive: true });
+  const { db, sqlite } = await createSqliteDb(join(dataDir, "andarama.db"));
+  const migrationsDir = findMigrationsDir();
+  const applied = await migrateSqlite(sqlite, migrationsDir, {
+    backupPath: join(dataDir, `anda-backup-${new Date().toISOString().slice(0, 10)}.db`),
+  });
+  if (applied.length > 0) console.log(`[db] migraciones aplicadas: ${applied.join(", ")}`);
+
+  const s3Endpoint = env("S3_ENDPOINT");
+  const smtpPort = env("SMTP_PORT");
+  const oidcIssuer = env("OIDC_ISSUER");
+  const oidcClientId = env("OIDC_CLIENT_ID");
+  const oidcClientSecret = env("OIDC_CLIENT_SECRET");
+  const clerkPublishableKey = env("CLERK_PUBLISHABLE_KEY");
+  const clerkSecretKey = env("CLERK_SECRET_KEY");
+
+  const queue = createInProcessQueue();
+  const runtime: PlatformRuntime = {
+    platform: "node",
+    publicUrl,
+    db,
+    kv: createSqliteKv(sqlite),
+    storage: createFsStorage({
+      rootDir: join(dataDir, "storage"),
+      hmacSecret: secret,
+      publicUrl,
+      s3:
+        s3Endpoint != null
+          ? {
+              endpoint: s3Endpoint,
+              bucket: env("S3_BUCKET") ?? "andarama",
+              accessKeyId: env("S3_ACCESS_KEY_ID") ?? "",
+              secretAccessKey: env("S3_SECRET_ACCESS_KEY") ?? "",
+              region: env("S3_REGION"),
+            }
+          : undefined,
+    }),
+    queue,
+    analytics: createSqlAnalytics(db),
+    passwords: createArgon2Hasher(),
+    email: createSmtpEmail({
+      host: env("SMTP_HOST"),
+      port: smtpPort != null ? parseInt(smtpPort, 10) : undefined,
+      secure: env("SMTP_SECURE") === "1",
+      user: env("SMTP_USER"),
+      pass: env("SMTP_PASS"),
+      from: env("EMAIL_FROM") ?? "andarama@localhost",
+    }),
+    deferred: (p) => {
+      void p.catch((err) => console.error("[deferred]", err));
+    },
+  };
+
+  // Procesador de trabajos pesados en el propio proceso (§5.5)
+  queue.start(async (msg) => {
+    await processJob({ db: db as Db, runtime, heavyCapable: true }, msg.id);
+  });
+
+  const config: AppConfig = {
+    publicUrl,
+    secret,
+    emailFrom: env("EMAIL_FROM") ?? "andarama@localhost",
+    turnstileSiteKey: env("TURNSTILE_SITE_KEY"),
+    turnstileSecret: env("TURNSTILE_SECRET"),
+    conversionsToken: env("CONVERSIONS_TOKEN"),
+    demoNotifyTo: env("DEMO_NOTIFY_TO"),
+    maxUploadBytes: 512 * 1024 * 1024,
+    oidc:
+      oidcIssuer != null && oidcClientId != null && oidcClientSecret != null
+        ? {
+            issuer: oidcIssuer,
+            clientId: oidcClientId,
+            clientSecret: oidcClientSecret,
+            allowedDomains: env("OIDC_ALLOWED_DOMAINS")?.split(",").map((d) => d.trim()),
+          }
+        : undefined,
+    // Opcional también en Node: quien quiera Clerk en su servidor puede ponerlo
+    clerk:
+      clerkPublishableKey != null && clerkSecretKey != null
+        ? {
+            publishableKey: clerkPublishableKey,
+            secretKey: clerkSecretKey,
+            jwtKey: env("CLERK_JWT_KEY"),
+            authorizedParties: env("CLERK_AUTHORIZED_PARTIES")?.split(",").map((s) => s.trim()).filter((s) => s !== ""),
+          }
+        : undefined,
+    templates: parseTemplatesConfig(process.env.SAMPLE_PROJECT_ID, process.env.TEMPLATE_PROJECTS),
+    adminEmails: parseAdminEmails(process.env.ADMIN_EMAILS),
+    clerkWebhookSecret: process.env.CLERK_WEBHOOK_SECRET,
+  };
+
+  // La sala de edición solo deja entrar con un billete que firma la API
+  // (POST /api/v1/projects/{id}/realtime) con este mismo secreto
+  const realtime = await createRealtimeServer({ secret });
+
+  const app = createApp({
+    runtime,
+    config,
+    createLiveRoom: async () => realtime.createLiveRoom(),
+    notifyProject: (projectId, event) => realtime.notifyProject(projectId, event),
+  });
+
+  // Estaticos: Studio (SPA) y bundle del visor
+  const assetRoots = findAssetRoots();
+  const showLanding = env("SHOW_LANDING") === "1";
+
+  const server = serve(
+    {
+      fetch: async (request: Request) => {
+        const url = new URL(request.url);
+        // Dominio propio (CNAME/proxy): host distinto del canonico -> tour en la raiz
+        let effectiveRequest = request;
+        const canonicalHost = (() => {
+          try {
+            return new URL(publicUrl).host;
+          } catch {
+            return url.host;
+          }
+        })();
+        if (url.host !== canonicalHost) {
+          const p = url.pathname;
+          const passthrough =
+            p.startsWith("/api/") || p.startsWith("/viewer/") || p.startsWith("/ingest/") || p.startsWith("/studio") ||
+            p.startsWith("/rt/") || p.startsWith("/docs") || p.startsWith("/t/") || p.startsWith("/embed.js");
+          if (!passthrough) {
+            const slug = await runtime.kv.get(`domain:${url.host}`);
+            if (slug != null) {
+              const rewritten = new URL(url.toString());
+              rewritten.pathname = `/t/${slug}${p === "/" ? "" : p}`;
+              effectiveRequest = new Request(rewritten.toString(), request);
+            }
+          }
+        }
+        if (new URL(effectiveRequest.url).pathname === "/") {
+          // En una instalación propia la portada lleva directo al Studio: la
+          // landing es la de andarama.com (precios, «Entrar» en
+          // app.andarama.com) y a un centro que instala la suya lo manda fuera.
+          // Quien la quiera puede pedirla con SHOW_LANDING=1.
+          if (showLanding) {
+            const landing = await serveStatic(assetRoots, "/landing/index.html");
+            if (landing != null) return landing;
+          }
+          return Response.redirect(`${publicUrl}/studio/`, 302);
+        }
+        const response = await app.fetch(effectiveRequest);
+        if (response.status === 404 && request.method === "GET" && !url.pathname.startsWith("/api/")) {
+          const asset = await serveStatic(assetRoots, url.pathname);
+          if (asset != null) return asset;
+          // El sitio público (apps/web) está en /landing dentro de los assets,
+          // pero sus enlaces internos son de raíz (/en/, /blog/, /_astro/…),
+          // igual que en el apex de Cloudflare.
+          const seccion = /^\/(studio|docs|viewer|landing)(\/|$)/.test(url.pathname);
+          if (!seccion) {
+            const web = await serveStatic(assetRoots, `/landing${url.pathname}`);
+            if (web != null) return web;
+          }
+          if (url.pathname.startsWith("/studio")) {
+            const spa = await serveStatic(assetRoots, "/studio/index.html");
+            if (spa != null) return spa;
+          }
+        }
+        return response;
+      },
+      port,
+      hostname: "0.0.0.0",
+    },
+    (info) => {
+      console.log(`Andarama self-host escuchando en http://localhost:${info.port} (datos en ${dataDir})`);
+    },
+  );
+
+  // WebSockets de tiempo real en el mismo puerto
+  (server as unknown as { on: (ev: string, fn: (...args: any[]) => void) => void }).on(
+    "upgrade",
+    (req: import("node:http").IncomingMessage, socket: import("node:stream").Duplex, head: Buffer) => {
+      if (!realtime.handleUpgrade(req, socket, head)) {
+        socket.destroy();
+      }
+    },
+  );
+}
+
+function findMigrationsDir(): string {
+  const candidates = [
+    resolve(here, "../../../packages/db/migrations"),
+    resolve(here, "../node_modules/@andarama/db/migrations"),
+    resolve(process.cwd(), "node_modules/@andarama/db/migrations"),
+    resolve(here, "./migrations"),
+  ];
+  for (const dir of candidates) {
+    if (existsSync(join(dir, "0001_init.sql"))) return dir;
+  }
+  throw new Error("No se encontró el directorio de migraciones");
+}
+
+function findAssetRoots(): string[] {
+  const roots: string[] = [];
+  const candidates = [
+    env("ASSETS_DIR"),
+    resolve(here, "./assets"),
+    resolve(here, "../assets"),
+    resolve(here, "../../studio/dist-root"),
+  ].filter((d): d is string => d != null);
+  for (const dir of candidates) {
+    if (existsSync(dir)) roots.push(dir);
+  }
+  return roots;
+}
+
+async function serveStatic(roots: string[], pathname: string): Promise<Response | null> {
+  let clean = decodeURIComponent(pathname).replaceAll("\\", "/");
+  if (clean.includes("..")) return null;
+  // Como Workers Assets: un directorio o una URL limpia sirven su index.html
+  // (la documentación genera /docs/usuario/grafo/index.html).
+  if (clean.endsWith("/")) clean += "index.html";
+  else if (!/\.[a-z0-9]+$/i.test(clean.split("/").pop() ?? "")) clean += "/index.html";
+  for (const root of roots) {
+    const filePath = join(root, clean);
+    try {
+      const s = await stat(filePath);
+      if (!s.isFile()) continue;
+      const stream = createReadStream(filePath);
+      const { Readable } = await import("node:stream");
+      return new Response(Readable.toWeb(stream) as unknown as ReadableStream, {
+        headers: {
+          "content-type": guessContentType(extname(filePath).slice(1) === "" ? "x.html" : filePath),
+          // Misma politica que _headers en Cloudflare: los nombres con hash son
+          // inmutables; los estables (viewer.js, index.html) se revalidan siempre.
+          "cache-control": clean.includes("/chunks/") || /\.[a-f0-9]{8,}\./.test(clean) ? "public, max-age=31536000, immutable" : "no-cache",
+        },
+      });
+    } catch {
+      // no existe en esta raiz
+    }
+  }
+  return null;
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

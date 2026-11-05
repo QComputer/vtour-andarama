@@ -1,0 +1,96 @@
+import type { Hotspot, Scene, Tour, ViewParams } from "@andarama/schema";
+import type { VrPdfDocument } from "./engine/xr/panel.js";
+
+export interface TourViewerOptions {
+  /** Contenedor DOM donde montar el visor. */
+  container: HTMLElement;
+  tour: Tour;
+  /** Idioma inicial (por defecto: de la URL o defaultLang). */
+  lang?: string;
+  /** Prefijo base para resolver rutas relativas de medios. */
+  baseUrl?: string;
+  /** Modo edicion (Studio): desactiva autorotate/autopilot/analytics. */
+  editMode?: boolean;
+  /** Sincronizar la vista con el hash de la URL (deep links). */
+  deepLinks?: boolean;
+  /** Endpoint de analitica; null desactiva el envio. */
+  analyticsEndpoint?: string | null;
+  /** Callback de eventos de analitica adicional (para el Studio o LTI). */
+  onAnalytics?: (event: ViewerAnalyticsEvent) => void;
+  /** Respetar prefers-reduced-motion (por defecto true). */
+  respectReducedMotion?: boolean;
+  /**
+   * Traductor de la interfaz. Lo aporta la skin para que los textos del modo
+   * inmersivo (paneles, botones) sigan el idioma del tour.
+   */
+  translate?: (key: string, params?: Record<string, string | number>) => string;
+  /**
+   * Abre un PDF para enseñarlo dentro de las gafas. Lo aporta la skin, que
+   * ya carga pdf.js de forma perezosa para el panel plano; sin él, el PDF se
+   * ofrece para verlo al salir de VR.
+   */
+  loadPdf?: (url: string) => Promise<VrPdfDocument>;
+}
+
+export interface ViewerAnalyticsEvent {
+  event: "view" | "scene" | "hotspot" | "duration" | "quiz" | "form" | "share" | "vr" | "heartbeat";
+  sceneId?: string;
+  hotspotId?: string;
+  durationMs?: number;
+  yaw?: number;
+  pitch?: number;
+  meta?: Record<string, unknown>;
+}
+
+export interface SceneChangeEvent {
+  scene: Scene;
+  previous: Scene | null;
+}
+
+export interface HotspotActivateEvent {
+  hotspot: Hotspot;
+  scene: Scene;
+  /** Elemento marcador (ancla para paneles). */
+  element: HTMLElement | null;
+}
+
+export interface QuizStateEvent {
+  score: number;
+  maxScore: number;
+  answered: number;
+  total: number;
+  passed: boolean | null;
+  /**
+   * Una entrada por pregunta respondida. `questionId` solo viene en los
+   * marcadores con varias preguntas (`questions`); en los de una sola, la
+   * pregunta es el propio marcador.
+   */
+  detail: { hotspotId: string; questionId?: string; sceneId: string; correct: boolean; points: number; selected?: string[] }[];
+}
+
+export type ViewerEventMap = {
+  ready: { scene: Scene };
+  sceneChange: SceneChangeEvent;
+  viewChange: ViewParams;
+  hotspotActivate: HotspotActivateEvent;
+  hotspotDeactivate: Record<string, never>;
+  /** Modo edicion: un marcador se esta arrastrando o se ha soltado. */
+  hotspotMove: { hotspot: Hotspot; yaw: number; pitch: number; phase: "move" | "end" };
+  varsChange: Record<string, string | number | boolean>;
+  quizChange: QuizStateEvent;
+  langChange: { lang: string };
+  muteChange: { muted: boolean };
+  vrChange: { active: boolean; mode: "xr" | "cardboard" | null };
+  autopilotChange: { active: boolean; routeId: string | null; reason: "start" | "next" | "finished" | "stopped" | "paused" };
+  narrationBlock: { blocked: boolean };
+  /** Se intentó salir de la escena y algo lo impide. */
+  navBlocked: { reason: "quiz" | "form" | "treasure" | "narration"; hotspotId?: string };
+  /** Cambia la pregunta con compuerta que retiene en la escena (null = libre). */
+  gateChange: { hotspotId: string | null; reason: "quiz" | "form" | "treasure" | null };
+  treasureProgress: { found: number; total: number; lastFound?: string };
+  error: { message: string; cause?: unknown };
+};
+
+export type ViewerEventName = keyof ViewerEventMap;
+
+export type Unsubscribe = () => void;
