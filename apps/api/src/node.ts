@@ -227,8 +227,6 @@ async function main(): Promise<void> {
     },
   );
   server.requestTimeout = 30 * 60 * 1000;
-  server.headersTimeout = 2 * 60 * 1000;
-  server.keepAliveTimeout = 5 * 1000;
 
   // WebSockets de tiempo real en el mismo puerto
   (server as unknown as { on: (ev: string, fn: (...args: any[]) => void) => void }).on(
