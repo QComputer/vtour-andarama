@@ -226,6 +226,9 @@ async function main(): Promise<void> {
       console.log(`Andarama self-host escuchando en http://localhost:${info.port} (datos en ${dataDir})`);
     },
   );
+  server.requestTimeout = 30 * 60 * 1000;
+  server.headersTimeout = 2 * 60 * 1000;
+  server.keepAliveTimeout = 5 * 1000;
 
   // WebSockets de tiempo real en el mismo puerto
   (server as unknown as { on: (ev: string, fn: (...args: any[]) => void) => void }).on(
